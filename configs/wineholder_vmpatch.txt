@@ -1,0 +1,65 @@
+
+dataset_name = nsvf
+datadir = ./data/Synthetic_NSVF/Wineholder
+expname = exp_Wineholder_VMpatch_E2U
+basedir = ./log
+model_name = TensorVMSplitPatch
+
+n_iters = 50000
+batch_size = 2048
+
+vm_reso_max = 64 
+patch_cap = 96                  
+voxel_budget = 64_000_000
+vram_budget_MB = 10240
+
+N_voxel_init = 2097156 # 128**3
+N_voxel_final = 27000000 # 300**3
+init_grid_res = [2, 2, 2]
+init_vm_res = [8, 8, 8]
+rank_min_res = 8
+
+strict_even_kick = 1500               
+strict_even_target_G = [3, 3, 3]      
+strict_even_warmup_iters = 300 
+split_even_kicks = [3000, 4500, 6000, 9000, 12000]
+vm_upsamp_list = [18000, 24000]
+
+split_cooldown = 800
+split_psnr_drop_thres = 0.3
+split_after_upsamp_offset = 800
+
+heartbeat_every = 250
+repair_adjacent_only=True
+
+critrn_lambda = 0.5
+logmargin_base = 1.05
+critrn_accept_ratio = 0.5
+critrn_refine_frac = 0.3
+
+N_vis = 5
+vis_every = 5000
+
+render_test = 1
+
+n_factors_sigma = [16, 16, 16]
+n_factors_app = [48, 48, 48]
+
+selective_rank_autoscale = 128 
+rank_autoscale_gamma = 0.6 
+rank_autoscale_alpha_keep_q = 0.85
+
+shadingMode = MLP_Fea
+fea2denseAct = softplus
+
+view_pe = 2
+fea_pe = 2
+
+lr_upsample_reset = 0
+
+L1_weight_inital = 8e-5
+L1_weight_rest = 4e-5
+TV_weight_density = 0.0
+TV_weight_app = 0.0
+
+rm_weight_mask_thre = 1e-4
