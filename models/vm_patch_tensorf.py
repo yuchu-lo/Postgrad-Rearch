@@ -559,7 +559,7 @@ class TensorVMSplitPatch(TensorBase):
         patch['app_line']      = _to_paramlist(patch['app_line'])
 
         if 'basis_mat' in patch and isinstance(patch['basis_mat'], torch.nn.Module):
-           patch['basis_mat'] = patch['basis_mat'].to(device)
+           patch['basis_mat'] = self.get_shared_basis(in_dim, self.app_dim)
 
         return patch
 
