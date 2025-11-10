@@ -1084,12 +1084,8 @@ class TensorVMSplitPatch(TensorBase):
 
         # Residual (only active in interior for boundary continuity)
         if bool(getattr(self, "enable_child_residual", True)):
-            if use_shared_basis:
-                rpl = patch.get('density_plane_res', None)
-                rln = patch.get('density_line_res',  None)
-            else:
-                rpl = patch.get('density_plane_res', None)
-                rln = patch.get('density_line_res',  None)
+            rpl = patch.get('density_plane_res', None)
+            rln = patch.get('density_line_res',  None)
             
             if (rpl is not None) and (rln is not None):
                 g = self._interior_gate(xyz_sampled).squeeze(-1)  # [N]
@@ -1186,7 +1182,7 @@ class TensorVMSplitPatch(TensorBase):
 
         patch_key = patch.get("_key", (0, 0, 0))
 
-        if self.use_shared_basis and hasattr(self, 'shared_basis_manager'):
+        if use_shared_basis and hasattr(self, 'shared_basis_manager'):
             # 獲取 patch key
             patch_key = patch.get("_key", None)
             if patch_key is None:
@@ -2283,7 +2279,10 @@ class TensorVMSplitPatch(TensorBase):
         return int(sum(p.shape[1] for p in app_plane_list) + sum(l.shape[1] for l in app_line_list))
 
     def _ensure_basis_for_feat(self, patch: dict, feat_dim: int):
-        """確保 patch['basis_mat'] 的 in_features == feat_dim；不符就重建（盡量沿用舊權重）"""
+        # basis_lowrank_enable=True -> skip if lowrank processing mode
+        if 'mix_W' in patch and 'basis_B' in patch:
+            return
+
         lin = patch.get('basis_mat', None)
         if lin is None:
             patch['basis_mat'] = self.get_shared_basis(feat_dim, self.app_dim)
