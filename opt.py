@@ -254,6 +254,16 @@ def config_parser(cmd=None):
     parser.add_argument('--ppr_importance_threshold', type=float, default=0.7,
                         help='Importance threshold for resolution boost in PPR')
 
+    # ===== Split safeguard =====
+    parser.add_argument('--max_split_depth', type=int, default=3,
+                        help='Maximum split depth allowed')
+    parser.add_argument('--late_max_split_depth', type=int, default=2,
+                        help='Maximum split depth in late training (>70%)')
+    parser.add_argument('--split_memory_reserve', type=float, default=0.15,
+                        help='Reserve memory ratio for future operations')
+    parser.add_argument('--split_complexity_decay', type=float, default=0.8,
+                        help='Decay rate for split threshold over training')
+
     # ===== Uneven criterion =====
     parser.add_argument('--critrn_mode', type=str, default='hybrid',
                         choices=['split', 'vm', 'hybrid'],
