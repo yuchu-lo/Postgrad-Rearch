@@ -575,49 +575,20 @@ class TensorVMSplitPatch(TensorBase):
     def _create_patch(self, res, device):
         gridSize = list(res)
         
-        if not self.global_basis_enable:
-            # Fallback to original implementation (for A/B testing)
-            density_plane, density_line = self._init_one_svd(self.density_n_comp, gridSize, 0.1, device)
-            app_plane,     app_line     = self._init_one_svd(self.app_n_comp,     gridSize, 0.1, device)
-            
-            patch = {
-                'res': gridSize.copy(),
-                'density_plane': density_plane,
-                'density_line':  density_line,
-                'app_plane':     app_plane,
-                'app_line':      app_line,
-            }
-        else:
-            # NEW: Use shared basis + per-patch coefficients
-            K_sigma = self.global_basis_k_sigma
-            K_app   = self.global_basis_k_app
-            
-            # Create coefficient matrices (much smaller than full tensors!)
-            density_plane = torch.nn.ParameterList([
-                torch.nn.Parameter(0.01 * torch.randn(self.density_n_comp[i], K_sigma, device=device))
-                for i in range(3)
-            ])
-            density_line = torch.nn.ParameterList([
-                torch.nn.Parameter(0.01 * torch.randn(self.density_n_comp[i], K_sigma, device=device))
-                for i in range(3)
-            ])
-            
-            app_plane = torch.nn.ParameterList([
-                torch.nn.Parameter(0.01 * torch.randn(self.app_n_comp[i], K_app, device=device))
-                for i in range(3)
-            ])
-            app_line = torch.nn.ParameterList([
-                torch.nn.Parameter(0.01 * torch.randn(self.app_n_comp[i], K_app, device=device))
-                for i in range(3)
-            ])
-            
-            patch = {
-                'res': gridSize.copy(),
-                'density_plane': density_plane,
-                'density_line':  density_line,
-                'app_plane':     app_plane,
-                'app_line':      app_line,
-            }
+        density_plane, density_line = self._init_one_svd(self.density_n_comp, gridSize, 0.1, device)
+        app_plane, app_line = self._init_one_svd(self.app_n_comp, gridSize, 0.1, device)
+        
+        for L in (density_plane, density_line, app_plane, app_line):
+            for t in L:
+                t.requires_grad_(True)
+        
+        patch = {
+            'res': gridSize.copy(),
+            'density_plane': density_plane,
+            'density_line': density_line,
+            'app_plane': app_plane,
+            'app_line': app_line,
+        }
 
         if bool(getattr(self, "enable_child_residual", True)):
             if not self.global_basis_enable:
@@ -695,15 +666,6 @@ class TensorVMSplitPatch(TensorBase):
                 p['density_line']  = to_param_list(p['density_line'])
                 p['app_plane']     = to_param_list(p['app_plane'])
                 p['app_line']      = to_param_list(p['app_line'])
-
-                # basis family
-                if 'basis_mat' in p and isinstance(p['basis_mat'], torch.nn.Module):
-                    p['basis_mat'] = p['basis_mat'].to(dev)
-                if 'basis_B' in p and isinstance(p['basis_B'], torch.nn.Module):
-                    p['basis_B'] = p['basis_B'].to(dev)
-                if 'mix_W' in p and isinstance(p['mix_W'], torch.nn.Parameter):
-                    p['mix_W'] = torch.nn.Parameter(p['mix_W'].detach().to(dev), requires_grad=True)
-
                 new_map[k] = p
             self.patch_map = new_map
 
@@ -759,7 +721,7 @@ class TensorVMSplitPatch(TensorBase):
         dev = self.aabb.device
 
         new_map = {}
-        template = self._create_patch([Rx, Ry, Rz], dev)  # 讓 template 依照當前 flags 建好 basis_mat 或 basis_B+mix_W
+        template = self._create_patch([Rx, Ry, Rz], dev)  
 
         def _clone_pl(pl):
             return torch.nn.ParameterList([
@@ -1380,10 +1342,6 @@ class TensorVMSplitPatch(TensorBase):
                         new_patch["density_line"] = _clone_pl(src["density_line"])
                         new_patch["app_plane"] = _clone_pl(src["app_plane"])
                         new_patch["app_line"] = _clone_pl(src["app_line"])
-
-                    if "basis_mat" in src:
-                        new_in  = self._app_in_dim_from_vm(new_patch["app_plane"], new_patch["app_line"])
-                        new_patch["basis_mat"] = self.get_shared_basis(new_in, self.app_dim)
                     
                     new_patch["res"] = R[:]
                     new_map[key] = self._ensure_patch_device(new_patch, device)
@@ -1572,14 +1530,12 @@ class TensorVMSplitPatch(TensorBase):
 
             # ---- app (base) ----
             new_ap, new_al = [], []
-            app_changed = False
             for i in range(3):
                 curC = int(P['app_plane'][i].shape[1])
                 needC = int(tgt_app_axes[i])
                 if needC != curC:
                     api, ali = self._resize_one_factor_block([P['app_plane'][i]], [P['app_line'][i]], c_new=needC)
                     new_ap.append(api[0]); new_al.append(ali[0])
-                    app_changed = True
                 else:
                     new_ap.append(P['app_plane'][i]); new_al.append(P['app_line'][i])
             P['app_plane'] = new_ap; P['app_line'] = new_al
@@ -1597,10 +1553,6 @@ class TensorVMSplitPatch(TensorBase):
                         new_ap_res.append(P['app_plane_res'][i]); new_al_res.append(P['app_line_res'][i])
                 P['app_plane_res'] = torch.nn.ParameterList(new_ap_res)
                 P['app_line_res']  = torch.nn.ParameterList(new_al_res)
-
-            if app_changed and hasattr(self, '_app_in_dim_from_vm'):
-                new_in = self._app_in_dim_from_vm(P['app_plane'], P['app_line'])
-                P['basis_mat'] = self.get_shared_basis(new_in, self.app_dim)
 
             upcnt += 1
 
@@ -1844,44 +1796,6 @@ class TensorVMSplitPatch(TensorBase):
         if verbose:
             print(f"[rank-autoscale] changed={changed} | mem {mem_before} → {mem_after} MB | keep_q={alpha_keep_q:.2f} ref_res={ref_res} γ={gamma}")
         return changed
-
-    @torch.no_grad()
-    def rank_prune_once(self, keep_ratio: float = 0.75):
-        for k, p in self.patch_map.items():
-            if ('mix_W' not in p) or ('basis_B' not in p): 
-                continue
-            W = p['mix_W']  # [r, in_dim]
-            r, d = W.shape
-            keep = max(1, int(round(r * keep_ratio)))
-         
-            l2 = torch.norm(W, dim=1)  # [r]
-            idx = torch.topk(l2, k=keep, largest=True).indices
-          
-            W_new = torch.nn.Parameter(W[idx].clone(), requires_grad=True)  # [keep, d]
-            B_old = p['basis_B']  # Linear(in=rank, out=app_dim)
-            B_new = torch.nn.Linear(keep, B_old.out_features, bias=False, device=W.device, dtype=W.dtype)
-    
-            with torch.no_grad():
-                B_new.weight.copy_(B_old.weight[:, idx])
-            p['mix_W']  = W_new
-            p['basis_B'] = B_new
-
-    def rank_regrow(self, add_rows: int = 0, std: float = 1e-3):
-        if add_rows <= 0: return
-        for k, p in self.patch_map.items():
-            if ('mix_W' not in p) or ('basis_B' not in p): 
-                continue
-            W = p['mix_W']
-            r, d = W.shape
-            extra = torch.randn((add_rows, d), device=W.device, dtype=W.dtype) * std
-            p['mix_W'] = torch.nn.Parameter(torch.cat([W, extra], dim=0), requires_grad=True)
-       
-            B = p['basis_B']
-            B_enlarged = torch.nn.Linear(r + add_rows, B.out_features, bias=False, device=W.device, dtype=W.dtype)
-            with torch.no_grad():
-                B_enlarged.weight.zero_()
-                B_enlarged.weight[:, :r].copy_(B.weight)
-            p['basis_B'] = B_enlarged
 
     def _current_ranks_from_patches(self):
         """
@@ -2666,26 +2580,12 @@ class TensorVMSplitPatch(TensorBase):
         child['depth'] = int(parent_patch.get('depth', 0)) + 1
         return child
 
-    def get_shared_basis(self, in_dim: int, out_dim: int, *, device=None, dtype=None) -> torch.nn.Linear:
+    def get_shared_basis(self, in_dim, out_dim):
         """
-        Return shared nn.Linear(in_dim, out_dim).
-        Only build one if the same in/out dim + same device/dtype, putting in self._basis_registry to use repeatedly.
+        兼容性存根 - 現在由 SharedBasisManager 處理
         """
-        in_dim  = int(in_dim)
-        out_dim = int(out_dim)
-        device  = device or self.aabb.device
-        if dtype is None:
-            dtype = getattr(self, "basis_dtype", None) or getattr(self.aabb, "dtype", torch.float32)
-
-        # registry key
-        dev_key = (device.type, device.index)
-        key = (in_dim, out_dim, dev_key, dtype)
-
-        lin = self._basis_registry.get(key, None)
-        if lin is None:
-            lin = torch.nn.Linear(in_dim, out_dim, bias=True).to(device=device, dtype=dtype)
-            self._basis_registry[key] = lin
-        return lin
+        # 返回一個簡單的 Linear layer 作為 fallback
+        return torch.nn.Linear(in_dim, out_dim, bias=False, device=self.aabb.device)
 
     def _app_in_dim_from_planes(self, app_plane_list):
         return int(sum(p.shape[1] for p in app_plane_list))
@@ -2721,11 +2621,6 @@ class TensorVMSplitPatch(TensorBase):
 
         spatial_params = unique(spatial_params)
         network_params = unique(network_params)
-
-        if 'basis_B' in patch and isinstance(patch['basis_B'], torch.nn.Module):
-            network_params += list(patch['basis_B'].parameters())
-        if 'mix_W' in patch and isinstance(patch['mix_W'], torch.nn.Parameter):
-            network_params.append(patch['mix_W'])
 
         return [
             {'params': spatial_params, 'lr': lr_spatial},
@@ -3745,19 +3640,6 @@ class TensorVMSplitPatch(TensorBase):
         body = ", ".join(f"{k}:{v}" for k, v in sorted(cnt.items(), key=lambda x: x[0]))
         print(f"{header} {body if body else '(no hits)'}")
 
-    def _serialize_patch(self, patch):
-        lin = patch["basis_mat"]
-        return {
-            "res": list(patch["res"]),
-            "density_plane": [p.detach().cpu() for p in patch["density_plane"]],
-            "density_line":  [p.detach().cpu() for p in patch["density_line"]],
-            "app_plane":     [p.detach().cpu() for p in patch["app_plane"]],
-            "app_line":      [p.detach().cpu() for p in patch["app_line"]],
-            "basis_w":       lin.weight.detach().cpu(),
-            "basis_b":       (lin.bias.detach().cpu() if lin.bias is not None else None),
-            "app_dim":       int(lin.out_features),
-        }
-
     def _deserialize_patch(self, P, device):
         R = list(P["res"])
         new_patch = self._create_patch(R, device)
@@ -3773,11 +3655,8 @@ class TensorVMSplitPatch(TensorBase):
 
         in_dim  = P["basis_w"].shape[1]
         out_dim = int(P.get("app_dim", P["basis_w"].shape[0]))
-        has_b   = (P["basis_b"] is not None)
         new_lin = torch.nn.Linear(in_dim, out_dim, bias=has_b).to(device)
         new_lin.weight.data.copy_(P["basis_w"].to(device))
-        if has_b:
-            new_lin.bias.data.copy_(P["basis_b"].to(device))
         new_patch["basis_mat"] = new_lin
         new_patch["res"] = R
         return new_patch
@@ -3927,26 +3806,6 @@ class TensorVMSplitPatch(TensorBase):
         return torch.nn.ParameterList([
             torch.nn.Parameter(p.detach().to(device), requires_grad=p.requires_grad) for p in pl
         ])
-
-    def _move_one_patch_to(self, patch, device):
-        patch['density_plane'] = self._to_device_paramlist(patch['density_plane'], device)
-        patch['density_line']  = self._to_device_paramlist(patch['density_line'],  device)
-        patch['app_plane']     = self._to_device_paramlist(patch['app_plane'],     device)
-        patch['app_line']      = self._to_device_paramlist(patch['app_line'],      device)
-
-        if 'basis_mat' in patch and isinstance(patch['basis_mat'], torch.nn.Module):
-            patch['basis_mat'] = patch['basis_mat'].to(device)
-        if 'basis_B' in patch and isinstance(patch['basis_B'], torch.nn.Module):
-            patch['basis_B'] = patch['basis_B'].to(device)
-        if 'mix_W' in patch and isinstance(patch['mix_W'], torch.nn.Parameter):
-            patch['mix_W'] = torch.nn.Parameter(patch['mix_W'].detach().to(device), requires_grad=True)
-
-        return patch
-
-    @torch.no_grad()
-    def move_all_patches_to(self, device):
-        for k in list(self.patch_map.keys()):
-            self.patch_map[k] = self._move_one_patch_to(self.patch_map[k], device)
 
     def forward(self, rays_chunk, white_bg=True, is_train=False, ndc_ray=False, N_samples=-1):
         """
