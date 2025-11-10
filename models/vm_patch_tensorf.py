@@ -72,13 +72,30 @@ class SharedBasisManager(torch.nn.Module):
         """剪枝不重要的基底維度"""
         if self.mode == 'global':
             # 分析所有係數，找出不常用的基底
-            importance = torch.zeros(self.n_basis)
+            importance = torch.zeros(self.n_basis, device=self.device)
             for coeffs in self.patch_coeffs.values():
                 importance += coeffs.weight.abs().sum(dim=0)
             
             # 保留重要的基底
             keep_mask = importance > threshold
-            # ... 實作剪枝邏輯
+            keep_indices = torch.where(keep_mask)[0]
+            
+            if len(keep_indices) < self.n_basis:
+                # 創建新的縮減基底
+                new_n_basis = len(keep_indices)
+                new_basis = torch.nn.Linear(new_n_basis, self.app_dim, bias=False)
+                new_basis.weight.data = self.global_basis.weight[:, keep_indices]
+                
+                # 更新所有係數矩陣
+                for key, coeffs in self.patch_coeffs.items():
+                    new_coeffs = torch.nn.Linear(coeffs.in_features, new_n_basis, bias=False)
+                    new_coeffs.weight.data = coeffs.weight[keep_indices, :]
+                    self.patch_coeffs[key] = new_coeffs
+                
+                self.global_basis = new_basis
+                self.n_basis = new_n_basis
+                
+                return self.n_basis  # 返回剩餘的基底數
     
 class GlobalBasisWrapper(torch.nn.Module):
     """包裝器，讓全域基底用起來像普通的 Linear layer"""
@@ -171,10 +188,11 @@ class TensorVMSplitPatch(TensorBase):
         self._seam_banks = torch.nn.ModuleDict()
         self.basis_dtype = getattr(self, "basis_dtype", torch.float32)
         
-        self.shared_basis_manager = SharedBasisManager(mode=basis_mode, n_basis=self.n_basis, app_dim=self.app_dim,
-                                                       device=device, dtype=self.basis_dtype,
-                                                       sparsity_reg=kargs.pop("basis_sparsity_reg", 0.01),
-                                                       adaptive=kargs.pop("basis_adaptive", True))
+        if not hasattr(self, 'shared_basis_manager'):
+            self.shared_basis_manager = SharedBasisManager(mode=basis_mode, n_basis=self.n_basis, app_dim=self.app_dim,
+                                                           device=device, dtype=self.basis_dtype,
+                                                           sparsity_reg=kargs.pop("basis_sparsity_reg", 0.01),
+                                                           adaptive=kargs.pop("basis_adaptive", True))
         
         gate_dtype = self.aabb.dtype  
         self.register_buffer("alpha_gate_scale", torch.ones((), dtype=gate_dtype))
@@ -627,6 +645,11 @@ class TensorVMSplitPatch(TensorBase):
             'app_line': app_line,
         }
 
+        temp_key = (0, 0, 0)
+        in_dim = self._app_in_dim_from_vm(patch['app_plane'], patch['app_line'])
+        basis = self.get_shared_basis(temp_key, in_dim)
+        patch['basis_mat'] = basis
+
         if bool(getattr(self, "enable_child_residual", True)):
             if not self.global_basis_enable:
                 def _zeros_like_pl(pl):
@@ -776,6 +799,10 @@ class TensorVMSplitPatch(TensorBase):
                         'app_line':      _clone_pl(template['app_line']),
                     }
                     new_map[(i, j, k)] = p
+
+        if 'basis_mat' in template:
+            in_dim = self._app_in_dim_from_vm(p['app_plane'], p['app_line'])
+            p['basis_mat'] = self.get_shared_basis((i, j, k), in_dim) 
 
         self.patch_map = new_map
         self.current_patch_keys = list(self.patch_map.keys())
@@ -1380,6 +1407,10 @@ class TensorVMSplitPatch(TensorBase):
                         new_patch["app_plane"] = _clone_pl(src["app_plane"])
                         new_patch["app_line"] = _clone_pl(src["app_line"])
                     
+                    if "basis_mat" in src:
+                        new_in = self._app_in_dim_from_vm(new_patch["app_plane"], new_patch["app_line"])
+                        new_patch["basis_mat"] = self.get_shared_basis(key, new_in) 
+
                     new_patch["res"] = R[:]
                     new_map[key] = self._ensure_patch_device(new_patch, device)
 
@@ -2617,8 +2648,13 @@ class TensorVMSplitPatch(TensorBase):
         child['depth'] = int(parent_patch.get('depth', 0)) + 1
         return child
 
-    def get_shared_basis(self, patch_key, in_dim, patch_info=None):
-        """獲取 basis（全域或共享）"""
+    def get_shared_basis(self, patch_key, in_dim):
+        """獲取 basis（需要 patch_key 來識別）"""
+        if not hasattr(self, 'shared_basis_manager'):
+            # Fallback：創建獨立的 Linear
+            return torch.nn.Linear(in_dim, self.app_dim, bias=False)
+        
+        patch_info = {'res': self.patch_map[patch_key].get('res', [32,32,32])} if patch_key in self.patch_map else None
         return self.shared_basis_manager.get_or_create_basis(patch_key, in_dim, patch_info)
 
     def _app_in_dim_from_planes(self, app_plane_list):
@@ -2627,6 +2663,8 @@ class TensorVMSplitPatch(TensorBase):
     def get_optparam_groups(self, lr_spatial=0.02, lr_network=0.001):
         spatial_params = []
         network_params = []
+        basis_params = []     
+        coeffs_params = [] 
 
         for patch in self.patch_map.values():
             spatial_params += list(patch['density_plane'])
@@ -2635,7 +2673,36 @@ class TensorVMSplitPatch(TensorBase):
             spatial_params += list(patch['app_line'])
 
             if 'basis_mat' in patch:
-                network_params += list(patch['basis_mat'].parameters())
+                if hasattr(self, 'shared_basis_manager') and self.shared_basis_manager.mode == 'global':
+                    pass
+                else:
+                    network_params += list(patch['basis_mat'].parameters())
+
+        if hasattr(self, 'shared_basis_manager'):
+            if self.shared_basis_manager.mode == 'global':
+                # 全域基底參數（學習率較低，更穩定）
+                if hasattr(self.shared_basis_manager, 'global_basis'):
+                    basis_params += list(self.shared_basis_manager.global_basis.parameters())
+                
+                # 各 patch 的係數參數（正常學習率）
+                if hasattr(self.shared_basis_manager, 'patch_coeffs'):
+                    for coeffs in self.shared_basis_manager.patch_coeffs.values():
+                        coeffs_params += list(coeffs.parameters())
+                        
+            elif self.shared_basis_manager.mode == 'shared':
+                # 共享基底庫
+                if hasattr(self.shared_basis_manager, '_basis_bank'):
+                    network_params += list(self.shared_basis_manager._basis_bank.parameters())
+            
+            elif self.shared_basis_manager.mode == 'hybrid':
+                # 混合模式：同時處理全域和共享
+                if hasattr(self.shared_basis_manager, 'global_basis'):
+                    basis_params += list(self.shared_basis_manager.global_basis.parameters())
+                if hasattr(self.shared_basis_manager, 'patch_coeffs'):
+                    for coeffs in self.shared_basis_manager.patch_coeffs.values():
+                        coeffs_params += list(coeffs.parameters())
+                if hasattr(self.shared_basis_manager, '_basis_bank'):
+                    network_params += list(self.shared_basis_manager._basis_bank.parameters())
 
         if hasattr(self, "_seam_banks"):
             for sid, bank in self._seam_banks.items():
@@ -2647,19 +2714,45 @@ class TensorVMSplitPatch(TensorBase):
             network_params += list(self.renderModule.parameters())
 
         def unique(params_list):
-            seen = set(); out = []
+            seen = set()
+            out = []
             for p in params_list:
                 if id(p) not in seen:
-                    seen.add(id(p)); out.append(p)
+                    seen.add(id(p))
+                    out.append(p)
             return out
 
         spatial_params = unique(spatial_params)
         network_params = unique(network_params)
+        basis_params = unique(basis_params)
+        coeffs_params = unique(coeffs_params)
 
-        return [
-            {'params': spatial_params, 'lr': lr_spatial},
-            {'params': network_params, 'lr': lr_network}
-        ]
+        param_groups = []
+    
+        if spatial_params:
+            param_groups.append({'params': spatial_params, 'lr': lr_spatial})
+        
+        if network_params:
+            param_groups.append({'params': network_params, 'lr': lr_network})
+        
+        # 全域基底模式的特殊參數組
+        if basis_params:
+            # 基底學習率較低（更穩定）
+            param_groups.append({
+                'params': basis_params, 
+                'lr': lr_network * 0.1,  
+                'name': 'global_basis'
+            })
+        
+        if coeffs_params:
+            # 係數使用正常的 network 學習率
+            param_groups.append({
+                'params': coeffs_params,
+                'lr': lr_network,
+                'name': 'patch_coeffs'
+            })
+
+        return param_groups
 
     def _app_feat_raw(self, patch, xyz_sampled):
         """
