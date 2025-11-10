@@ -1099,7 +1099,7 @@ def reconstruction(args):
             promoted.append(key)
         return promoted
 
-    exp_logger = ExperimentLogger(logfolder)
+    
 
     # TensoRF uses "divisor" for downsample; values < 1.0 upsample and will blow memory!
     if float(getattr(args, "downsample_train", 1.0)) < 1.0:
@@ -1146,6 +1146,7 @@ def reconstruction(args):
 
     dump_run_config(logfolder, args)
     log_hparams_boundary(args, summary_writer, logfolder, iteration=0)
+    exp_logger = ExperimentLogger(logfolder)
 
     now = datetime.now()
     with open(os.path.join(logfolder, 'time_stamp.txt'), 'a') as f:
@@ -1704,6 +1705,20 @@ def reconstruction(args):
 
     pbar = tqdm(range(args.n_iters), miniters=args.progress_refresh_rate, file=sys.stdout) 
     for iteration in pbar:
+        if iteration % 100 == 0:
+            # 統計各解析度的 patch 數量
+            res_stats = {}
+            for p in tensorf.patch_map.values():
+                r = p['res'][0]
+                res_stats[r] = res_stats.get(r, 0) + 1
+            print(f"[Debug] Res distribution: {res_stats}")
+            
+            # 檢查複雜度分布
+            complexities = [p.get('content_complexity', -1) 
+                        for p in tensorf.patch_map.values()]
+            if any(c > 0 for c in complexities):
+                print(f"[Debug] Complexity range: {min(complexities):.3f} - {max(complexities):.3f}")
+
         if iteration % 100 == 0:  
             exp_logger.log_iteration(
                 iteration=iteration,
