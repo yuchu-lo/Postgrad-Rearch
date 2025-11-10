@@ -248,8 +248,6 @@ def config_parser(cmd=None):
     parser.add_argument('--critrn_mode', type=str, default='hybrid',
                         choices=['split', 'vm', 'hybrid'],
                         help='refinement mode: split-only, VM-upgrade-only, or hybrid')
-    parser.add_argument('--critrn_every', type=int, default=1500, 
-                        help='apply uneven criterion every N iterations (reduce for faster training)')
     parser.add_argument('--critrn_vm_topk', type=int, default=8,
                         help='max number of patches to VM-upgrade per criterion pass')
     parser.add_argument('--critrn_split_topk', type=int, default=4,
