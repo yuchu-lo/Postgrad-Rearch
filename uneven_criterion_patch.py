@@ -18,6 +18,40 @@ def _aabb_minmax(aabb: torch.Tensor):
         return aabb[0], aabb[1]
     raise ValueError(f"Unexpected AABB shape {tuple(aabb.shape)}; expected (6,) or (2,3).")
 
+def get_split_depth(key, grid_reso):
+    """計算 patch 的 split 深度"""
+    if not grid_reso or len(grid_reso) != 3:
+        return 0
+    
+    # 假設初始 grid 是 (Gx, Gy, Gz)
+    # 每次 split 會讓 index 翻倍
+    # depth = log2(max_index / initial_grid_size)
+    max_idx = max(key)
+    initial_size = min(grid_reso)  # 保守估計
+    
+    if initial_size <= 0:
+        return 0
+    
+    depth = 0
+    while max_idx >= initial_size * (2 ** depth):
+        depth += 1
+    return depth
+
+def estimate_patch_memory(patch):
+    """估算單個 patch 的記憶體使用"""
+    total = 0
+    for k in ("density_plane", "density_line", "app_plane", "app_line"):
+        for T in patch.get(k, []):
+            if T is not None:
+                total += T.numel() * T.element_size()
+    
+    bm = patch.get("basis_mat", None)
+    if bm is not None and hasattr(bm, "weight"):
+        total += bm.weight.numel() * bm.weight.element_size()
+        if getattr(bm, "bias", None) is not None:
+            total += bm.bias.numel() * bm.bias.element_size()
+    return total
+
 @torch.no_grad()
 def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, device="cuda"):    
     """
@@ -398,6 +432,67 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
             "gain_per_mem": gain_per_mem,
         })
 
+    # ----------------- Safeguard: depth and memory control -----------------
+    def can_split_safely(key, patch, step, args):
+        """檢查是否可以安全 split"""
+        # 深度限制
+        max_depth = int(getattr(args, 'max_split_depth', 3))
+        depth = get_split_depth(key, tensorf.patch_grid_reso)
+        
+        # 訓練後期更嚴格
+        if step > args.n_iters * 0.7:
+            max_depth = int(getattr(args, 'late_max_split_depth', 2))
+        
+        if depth >= max_depth:
+            return False, f"depth_{depth}_exceeds_{max_depth}"
+        
+        # 記憶體預測
+        current_mem = tensorf.get_total_mem()
+        budget = float(getattr(args, 'vram_budget_MB', 1e9)) * 1024**2
+        
+        # Split 會產生 8 個 children，淨增 7 倍記憶體
+        patch_mem = estimate_patch_memory(patch)
+        delta_mem = patch_mem * 7  # 1 parent → 8 children
+        
+        # 考慮未來可能的 VM upsample
+        if step > args.n_iters * 0.5:
+            delta_mem *= 1.5  # 保守估計
+        
+        if current_mem + delta_mem > budget * 0.85:
+            return False, "memory_budget_exceeded"
+        
+        return True, None
+
+    # 動態調整 split 門檻和配額
+    progress = step / args.n_iters
+    current_patch_count = len(tensorf.patch_map)
+
+    # 動態門檻調整
+    if progress > 0.7:
+        tau = tau - 0.3  # 更嚴格
+    elif progress > 0.5:
+        tau = tau - 0.1
+
+    if current_patch_count > 100:
+        tau = tau - 0.2
+    elif current_patch_count > 64:
+        tau = tau - 0.1
+
+    # 動態配額調整
+    if progress < 0.3:
+        split_topk = split_topk  # 前期正常
+    elif progress < 0.6:
+        split_topk = max(2, int(split_topk * 0.75))  # 中期減少
+    else:
+        split_topk = max(1, int(split_topk * 0.5))   # 後期最少
+
+    # Patch 數量限制
+    if current_patch_count > 80:
+        split_topk = min(split_topk, 2)
+    if current_patch_count > 120:
+        split_topk = min(split_topk, 1)
+
+
     # ----------------- rank candidates & decide ops -----------------
     # original knobs
     mode          = str((getattr(args, "critrn_mode", "hybrid") or "hybrid")).strip().lower()  #  "vm" | "split" | "hybrid"
@@ -480,8 +575,36 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
                 to_promote.append(k)
 
     if mode in ("split", "hybrid"):
+        safe_splits = []
+        rejected_splits = []
+        
         for d in cand_split_sorted[:split_budget]:
+            key = d["key"]
+            patch = tensorf.patch_map[key]
+            
+            # 安全檢查
+            can_split, reason = can_split_safely(key, patch, step, args)
+            
+            if not can_split:
+                rejected_splits.append((key, reason))
+                continue
+            
+            # 內容複雜度檢查（使用動態門檻）
+            if d["avg_margin"] + d["split_cost"] > tau:
+                rejected_splits.append((key, "complexity_threshold"))
+                continue
+                
+            safe_splits.append(d)
+        
+        # 只選擇安全的 splits
+        for d in safe_splits[:split_topk]:
             to_split.append(d["key"])
+        
+        # 記錄被拒絕的 splits（用於 debug）
+        if len(rejected_splits) > 0:
+            print(f"[Split Safety] Rejected {len(rejected_splits)} splits:")
+            for key, reason in rejected_splits[:5]:  # 只顯示前5個
+                print(f"  - {key}: {reason}")
 
     n_ops = 0
 
@@ -673,7 +796,13 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
                 
                 children = tensorf.split_patch(key, parent, child_res)
                 new_map.update(children)
-            
+
+                parent_depth = get_split_depth(key, tensorf.patch_grid_reso)
+                for child_key in children.keys():
+                    children[child_key]['split_depth'] = parent_depth + 1
+                    children[child_key]['created_at'] = step
+                    children[child_key]['parent_complexity'] = parent.get('roughness', 0.5)
+
             tensorf.patch_map = new_map
             n_ops += len(to_split)
             
@@ -740,6 +869,19 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
             tensorf.assert_zero_origin_and_contiguous()
         except Exception as e:
             print(f"[WARN] assert_zero_origin_and_contiguous failed: {e}")
+
+    if len(to_split) > 0:
+        depth_stats = {}
+        for key, patch in tensorf.patch_map.items():
+            depth = patch.get('split_depth', get_split_depth(key, tensorf.patch_grid_reso))
+            depth_stats[depth] = depth_stats.get(depth, 0) + 1
+        
+        print(f"[Split Depth Distribution]: {depth_stats}")
+        
+        # 警告過深的 splits
+        max_observed = max(depth_stats.keys()) if depth_stats else 0
+        if max_observed >= 3:
+            print(f"[WARNING] Deep splits detected: max_depth={max_observed}")
 
     print(f"[uneven_criterion] done: ops={n_ops} (mode={mode}) — total patches={len(tensorf.patch_map)}")
     return int(n_ops)
