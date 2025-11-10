@@ -58,7 +58,17 @@ class TensorVMSplitPatch(TensorBase):
         self.split_child_res_policy = str(kargs.pop("split_child_res_policy", "arg"))     # "arg"|"half"|"scale"
         self.split_child_scale      = float(kargs.pop("split_child_scale", 1.0))          # 僅當 policy="scale" 時生效
         self.split_child_min        = int(kargs.pop("split_child_min", 16))               # 子 patch 每軸的最小 res 下限
-
+        
+        self.global_basis_enable = bool(kargs.pop("global_basis_enable", True))
+        self.global_basis_k_sigma = int(kargs.pop("global_basis_k_sigma", 64))
+        self.global_basis_k_app   = int(kargs.pop("global_basis_k_app", 96))
+        
+        # Cache for global basis (key: (res_tuple, type, axis))
+        if not hasattr(self, '_global_basis_cache'):
+            self._global_basis_cache = {}
+        
+        print(f"[Shared Basis] enabled={self.global_basis_enable}, K_sigma={self.global_basis_k_sigma}, K_app={self.global_basis_k_app}")
+        
         super().__init__(aabb, gridSize, device, **kargs)
 
         self.patch_map = {}  # (i,j,k) -> patch dict
@@ -406,30 +416,57 @@ class TensorVMSplitPatch(TensorBase):
     
     def _create_patch(self, res, device):
         gridSize = list(res)
-
-        density_plane, density_line = self._init_one_svd(self.density_n_comp, gridSize, 0.1, device)
-        app_plane,     app_line     = self._init_one_svd(self.app_n_comp,     gridSize, 0.1, device)
-
-        for L in (density_plane, density_line, app_plane, app_line):
-            for t in L:
-                t.requires_grad_(True)
-
-        in_dim = self._app_in_dim_from_vm(app_plane, app_line)
-
-        patch = {
-            'res': gridSize.copy(),
-            'density_plane': density_plane,
-            'density_line':  density_line,
-            'app_plane':     app_plane,
-            'app_line':      app_line,
-        }
+        
+        if not self.global_basis_enable:
+            # Fallback to original implementation (for A/B testing)
+            density_plane, density_line = self._init_one_svd(self.density_n_comp, gridSize, 0.1, device)
+            app_plane,     app_line     = self._init_one_svd(self.app_n_comp,     gridSize, 0.1, device)
+            
+            patch = {
+                'res': gridSize.copy(),
+                'density_plane': density_plane,
+                'density_line':  density_line,
+                'app_plane':     app_plane,
+                'app_line':      app_line,
+            }
+        else:
+            # NEW: Use shared basis + per-patch coefficients
+            K_sigma = self.global_basis_k_sigma
+            K_app   = self.global_basis_k_app
+            
+            # Create coefficient matrices (much smaller than full tensors!)
+            density_coef_plane = torch.nn.ParameterList([
+                torch.nn.Parameter(0.01 * torch.randn(self.density_n_comp[i], K_sigma, device=device))
+                for i in range(3)
+            ])
+            density_coef_line = torch.nn.ParameterList([
+                torch.nn.Parameter(0.01 * torch.randn(self.density_n_comp[i], K_sigma, device=device))
+                for i in range(3)
+            ])
+            
+            app_coef_plane = torch.nn.ParameterList([
+                torch.nn.Parameter(0.01 * torch.randn(self.app_n_comp[i], K_app, device=device))
+                for i in range(3)
+            ])
+            app_coef_line = torch.nn.ParameterList([
+                torch.nn.Parameter(0.01 * torch.randn(self.app_n_comp[i], K_app, device=device))
+                for i in range(3)
+            ])
+            
+            patch = {
+                'res': gridSize.copy(),
+                'density_coef_plane': density_coef_plane,
+                'density_coef_line':  density_coef_line,
+                'app_coef_plane':     app_coef_plane,
+                'app_coef_line':      app_coef_line,
+            }
+        
+        # Appearance basis (unchanged)
+        in_dim = self._app_in_dim_from_vm_or_coef(patch)
+        
         if getattr(self, "basis_lowrank_enable", False):
             r = int(getattr(self, "basis_rank", 16))
-            # per-patch mixing W: [r, in_dim]
-            mix_W = torch.nn.Parameter(
-                0.01 * torch.randn(r, in_dim, device=device), requires_grad=True
-            )
-            # shared basis B: Linear(r -> app_dim)
+            mix_W = torch.nn.Parameter(0.01 * torch.randn(r, in_dim, device=device), requires_grad=True)
             basis_B = self.get_shared_basis(r, self.app_dim)
             patch['mix_W']  = mix_W
             patch['basis_B'] = basis_B
@@ -437,17 +474,117 @@ class TensorVMSplitPatch(TensorBase):
             basis = self.get_shared_basis(in_dim, self.app_dim)
             patch['basis_mat'] = basis
 
+        # Residuals (if enabled)
         if bool(getattr(self, "enable_child_residual", True)):
-            def _zeros_like_pl(pl):
-                return torch.nn.ParameterList([
-                    torch.nn.Parameter(torch.zeros_like(p), requires_grad=True) for p in pl
+            if not self.global_basis_enable:
+                def _zeros_like_pl(pl):
+                    return torch.nn.ParameterList([
+                        torch.nn.Parameter(torch.zeros_like(p), requires_grad=True) for p in pl
+                    ])
+                patch['density_plane_res'] = _zeros_like_pl(patch['density_plane'])
+                patch['density_line_res']  = _zeros_like_pl(patch['density_line'])
+                patch['app_plane_res']     = _zeros_like_pl(patch['app_plane'])
+                patch['app_line_res']      = _zeros_like_pl(patch['app_line'])
+            else:
+                # Residuals also use coefficients
+                patch['density_coef_plane_res'] = torch.nn.ParameterList([
+                    torch.nn.Parameter(torch.zeros(self.density_n_comp[i], K_sigma, device=device))
+                    for i in range(3)
                 ])
-            patch['density_plane_res'] = _zeros_like_pl(density_plane)
-            patch['density_line_res']  = _zeros_like_pl(density_line)
-            patch['app_plane_res']     = _zeros_like_pl(app_plane)
-            patch['app_line_res']      = _zeros_like_pl(app_line)
+                patch['density_coef_line_res'] = torch.nn.ParameterList([
+                    torch.nn.Parameter(torch.zeros(self.density_n_comp[i], K_sigma, device=device))
+                    for i in range(3)
+                ])
+                patch['app_coef_plane_res'] = torch.nn.ParameterList([
+                    torch.nn.Parameter(torch.zeros(self.app_n_comp[i], K_app, device=device))
+                    for i in range(3)
+                ])
+                patch['app_coef_line_res'] = torch.nn.ParameterList([
+                    torch.nn.Parameter(torch.zeros(self.app_n_comp[i], K_app, device=device))
+                    for i in range(3)
+                ])
 
         return patch
+
+    def _app_in_dim_from_vm_or_coef(self, patch):
+        """
+        Get appearance input dimension from either full VM tensors or coefficients.
+        Compatible with both old and new patch structures.
+        """
+        if 'app_plane' in patch:
+            return int(sum(p.shape[1] for p in patch['app_plane']) + 
+                      sum(l.shape[1] for l in patch['app_line']))
+        elif 'app_coef_plane' in patch:
+            return int(sum(c.shape[0] for c in patch['app_coef_plane']) + 
+                      sum(c.shape[0] for c in patch['app_coef_line']))
+        else:
+            raise KeyError("Patch has neither app_plane nor app_coef_plane")
+    
+    def _get_or_create_global_basis(self, res, basis_type, axis):
+        """
+        Lazy initialization of global shared basis for a given (res, type, axis).
+        
+        Args:
+            res: (Rx, Ry, Rz) tuple - resolution of this patch
+            basis_type: "density" or "app"
+            axis: 0, 1, 2 (corresponding to XY, YZ, XZ planes)
+        
+        Returns:
+            (plane_basis, line_basis): each a nn.Parameter
+        """
+        key = (tuple(res), basis_type, axis)
+        
+        if key in self._global_basis_cache:
+            return self._global_basis_cache[key]
+        
+        # Determine spatial dimensions for this axis
+        mat_id_0, mat_id_1 = self.matMode[axis]
+        vec_id = self.vecMode[axis]
+        H, W = res[mat_id_1], res[mat_id_0]
+        L = res[vec_id]
+        
+        K = self.global_basis_k_sigma if basis_type == "density" else self.global_basis_k_app
+        device = self.aabb.device
+        
+        # Initialize with small random values
+        plane_basis = torch.nn.Parameter(
+            0.02 * torch.randn(1, K, H, W, device=device),
+            requires_grad=True
+        )
+        line_basis = torch.nn.Parameter(
+            0.02 * torch.randn(1, K, L, 1, device=device),
+            requires_grad=True
+        )
+        
+        # Register as model parameters (important for optimizer!)
+        param_name_plane = f"_gb_{basis_type}_ax{axis}_r{res[0]}x{res[1]}x{res[2]}_plane"
+        param_name_line  = f"_gb_{basis_type}_ax{axis}_r{res[0]}x{res[1]}x{res[2]}_line"
+        self.register_parameter(param_name_plane, plane_basis)
+        self.register_parameter(param_name_line, line_basis)
+        
+        self._global_basis_cache[key] = (plane_basis, line_basis)
+        
+        return plane_basis, line_basis
+    
+    def _reconstruct_from_coef(self, coef_plane, coef_line, global_plane, global_line):
+        """
+        Reconstruct full VM tensor from coefficients and global basis.
+        
+        Args:
+            coef_plane: [rank, K]
+            coef_line: [rank, K]
+            global_plane: [1, K, H, W]
+            global_line: [1, K, L, 1]
+        
+        Returns:
+            (reconstructed_plane [1, rank, H, W], reconstructed_line [1, rank, L, 1])
+        """
+        # Einstein summation: coef[rank, K] @ basis[K, spatial] -> [rank, spatial]
+        plane_recon = torch.einsum('rk,bkhw->brhw', coef_plane, global_plane)  # [1, rank, H, W]
+        line_recon  = torch.einsum('rk,bklw->brlw', coef_line,  global_line)   # [1, rank, L, 1]
+        
+        return plane_recon, line_recon
+
 
     def set_patch(self, patch_map=None, patch_key=None, d_plane=None, d_line=None, a_plane=None, a_line=None):
         """
@@ -723,45 +860,6 @@ class TensorVMSplitPatch(TensorBase):
             yield
         finally:
             self.enable_seam_blend = old
-
-
-    def compute_density_patch(self, patch, xyz_sampled):
-        """
-        Sample density features for one patch (before feature2density).
-        - xyz_sampled: [N,3] local coords in [0,1]
-        Returns: 
-            sigma_feat: [N]
-        """
-        if patch.get('dead', False):
-            return torch.zeros(xyz_sampled.shape[0], device=xyz_sampled.device)
-
-        # base VM 
-        coord_plane, coord_line = self._get_patch_coords(xyz_sampled)  # lists: [3,N,1,2] / [3,N,1,1]
-        N = xyz_sampled.shape[0]
-        device = xyz_sampled.device
-
-        sigma_acc = torch.zeros(N, device=device)
-        for i, (plane, line) in enumerate(zip(patch['density_plane'], patch['density_line'])):
-            pfeat = self._gs2d_1CHW(plane, coord_plane[i])  # (N, C)
-            lfeat = self._gs1d_1CL1(line,  coord_line[i])   # (N, C)
-            sigma_acc += (pfeat * lfeat).sum(dim=1)         # -> (N,)
-
-        # residual (only active in the interior -> boundary continuity)
-        if bool(getattr(self, "enable_child_residual", True)):
-            rpl = patch.get('density_plane_res', None)
-            rln = patch.get('density_line_res',  None)
-            if (rpl is not None) and (rln is not None):
-                g = self._interior_gate(xyz_sampled).squeeze(-1)  # [N]
-                r_acc = torch.zeros_like(sigma_acc)
-                for i, (rplane, rline) in enumerate(zip(rpl, rln)):
-                    rp = self._gs2d_1CHW(rplane, coord_plane[i])  # (N, C)
-                    rl = self._gs1d_1CL1(rline,  coord_line[i])   # (N, C)
-                    r_acc += (rp * rl).sum(dim=1)                 # (N,)
-                sigma_acc = sigma_acc + g * r_acc
-
-        # seam blending near patch faces (inference-time smoothing, no extra params/loss)
-        sigma_acc = self._blend_with_neighbors_if_needed(patch, xyz_sampled, sigma_acc, kind="density")
-        return sigma_acc
     
     def apply_seam_tying(self):
         """
@@ -770,61 +868,160 @@ class TensorVMSplitPatch(TensorBase):
         """
         return
 
+    def compute_density_patch(self, patch, xyz_sampled):
+        """
+        Sample density features for one patch (before feature2density).
+        Now supports both old (full tensors) and new (coefficients + shared basis) formats.
+        """
+        if patch.get('dead', False):
+            return torch.zeros(xyz_sampled.shape[0], device=xyz_sampled.device)
+
+        coord_plane, coord_line = self._get_patch_coords(xyz_sampled)
+        N = xyz_sampled.shape[0]
+        device = xyz_sampled.device
+        
+        sigma_acc = torch.zeros(N, device=device)
+        res = tuple(patch['res'])
+        
+        # Check if using shared basis (new) or full tensors (old)
+        use_shared_basis = ('density_coef_plane' in patch) and self.global_basis_enable
+        
+        for i in range(3):
+            if use_shared_basis:
+                # NEW PATH: Reconstruct from coefficients + global basis
+                global_plane, global_line = self._get_or_create_global_basis(res, "density", i)
+                coef_p = patch['density_coef_plane'][i]  # [rank, K]
+                coef_l = patch['density_coef_line'][i]   # [rank, K]
+                
+                plane_recon, line_recon = self._reconstruct_from_coef(
+                    coef_p, coef_l, global_plane, global_line
+                )
+                
+                pfeat = self._gs2d_1CHW(plane_recon, coord_plane[i])  # [N, rank]
+                lfeat = self._gs1d_1CL1(line_recon,  coord_line[i])   # [N, rank]
+            else:
+                # OLD PATH: Direct sampling from full tensors
+                plane = self._plane_param_for(patch, 'density', i)
+                line  = self._line_param_for(patch, 'density', i)
+                
+                pfeat = self._gs2d_1CHW(plane, coord_plane[i])
+                lfeat = self._gs1d_1CL1(line,  coord_line[i])
+            
+            sigma_acc += (pfeat * lfeat).sum(dim=1)
+
+        # Residual (only active in interior for boundary continuity)
+        if bool(getattr(self, "enable_child_residual", True)):
+            if use_shared_basis:
+                rpl = patch.get('density_coef_plane_res', None)
+                rln = patch.get('density_coef_line_res',  None)
+            else:
+                rpl = patch.get('density_plane_res', None)
+                rln = patch.get('density_line_res',  None)
+            
+            if (rpl is not None) and (rln is not None):
+                g = self._interior_gate(xyz_sampled).squeeze(-1)  # [N]
+                r_acc = torch.zeros_like(sigma_acc)
+                
+                for i in range(3):
+                    if use_shared_basis:
+                        global_plane, global_line = self._get_or_create_global_basis(res, "density", i)
+                        rp_recon, rl_recon = self._reconstruct_from_coef(
+                            rpl[i], rln[i], global_plane, global_line
+                        )
+                        rp = self._gs2d_1CHW(rp_recon, coord_plane[i])
+                        rl = self._gs1d_1CL1(rl_recon, coord_line[i])
+                    else:
+                        rplane, rline = rpl[i], rln[i]
+                        rp = self._gs2d_1CHW(rplane, coord_plane[i])
+                        rl = self._gs1d_1CL1(rline,  coord_line[i])
+                    
+                    r_acc += (rp * rl).sum(dim=1)
+                
+                sigma_acc = sigma_acc + g * r_acc
+
+        # Seam blending (inference-time smoothing)
+        sigma_acc = self._blend_with_neighbors_if_needed(patch, xyz_sampled, sigma_acc, kind="density")
+        return sigma_acc
+    
     def compute_app_patch(self, patch, xyz):
         """
         Build appearance features and project via basis matrix.
-        - xyz_sampled: [N,3] local coords in [0,1]
-        Returns: 
-            app_feat: [N, app_dim]
-
-        Note:
-            - Each entry in patch['app_plane'] / patch['app_line'] is a 4D tensor:
-                plane: [1, C, H, W], line: [1, C, L, 1].
-            - Do NOT index like py[1] etc.; pass the full 4D tensors to samplers.
+        Now supports both old and new formats.
         """
-        # unpack per-axis tensors (each is a single Parameter of shape [1,C,H,W] / [1,C,L,1])
-        px = self._plane_param_for(patch, 'app', 0)
-        py = self._plane_param_for(patch, 'app', 1)
-        pz = self._plane_param_for(patch, 'app', 2)
-        lx = self._line_param_for (patch, 'app', 0)
-        ly = self._line_param_for (patch, 'app', 1)
-        lz = self._line_param_for (patch, 'app', 2)
+        coord_plane, coord_line = self._get_patch_coords(xyz)
+        N = xyz.shape[0]
+        device = xyz.device
+        res = tuple(patch['res'])
+        
+        use_shared_basis = ('app_coef_plane' in patch) and self.global_basis_enable
+        
+        # Base features
+        comps = []
+        for i in range(3):
+            if use_shared_basis:
+                global_plane, global_line = self._get_or_create_global_basis(res, "app", i)
+                coef_p = patch['app_coef_plane'][i]
+                coef_l = patch['app_coef_line'][i]
+                
+                plane_recon, line_recon = self._reconstruct_from_coef(
+                    coef_p, coef_l, global_plane, global_line
+                )
+                
+                fx = self._gs2d_1CHW(plane_recon, coord_plane[i])
+                gx = self._gs1d_1CL1(line_recon,  coord_line[i])
+            else:
+                px = self._plane_param_for(patch, 'app', i)
+                lx = self._line_param_for(patch, 'app', i)
+                
+                fx = self._gs2d_1CHW(px, coord_plane[i])
+                gx = self._gs1d_1CL1(lx, coord_line[i])
+            
+            comps.extend([fx, gx])
+        
+        feat = torch.cat(comps, dim=1)  # [N, C_total]
 
-        # base features: grid-sample each mode with the right coordinate pairing
-        # (x uses yz plane, y uses xz, z uses xy), and 1D lines use the respective axis
-        fx = self._gs2d_1CHW(px, xyz[:, [1, 2]])  # (N, Cx)
-        fy = self._gs2d_1CHW(py, xyz[:, [0, 2]])  # (N, Cy)
-        fz = self._gs2d_1CHW(pz, xyz[:, [0, 1]])  # (N, Cz)
-
-        gx = self._gs1d_1CL1(lx, xyz[:, [0]])     # (N, Cx)
-        gy = self._gs1d_1CL1(ly, xyz[:, [1]])     # (N, Cy)
-        gz = self._gs1d_1CL1(lz, xyz[:, [2]])     # (N, Cz)
-
-        feat = torch.cat([fx, fy, fz, gx, gy, gz], dim=1)  # (N, C_total)
-
-        # interior-gated residuals (keep faces continuous by turning residual off near boundaries)
+        # Interior-gated residuals
         if bool(getattr(self, "enable_child_residual", True)):
-            rpl = patch.get('app_plane_res', None)
-            rln = patch.get('app_line_res',  None)
+            if use_shared_basis:
+                rpl = patch.get('app_coef_plane_res', None)
+                rln = patch.get('app_coef_line_res',  None)
+            else:
+                rpl = patch.get('app_plane_res', None)
+                rln = patch.get('app_line_res',  None)
+            
             if (rpl is not None) and (rln is not None):
-                rfeat = self._app_feat_raw(patch, xyz)
+                rfeat_comps = []
+                for i in range(3):
+                    if use_shared_basis:
+                        global_plane, global_line = self._get_or_create_global_basis(res, "app", i)
+                        rp_recon, rl_recon = self._reconstruct_from_coef(
+                            rpl[i], rln[i], global_plane, global_line
+                        )
+                        rp = self._gs2d_1CHW(rp_recon, coord_plane[i])
+                        rl = self._gs1d_1CL1(rl_recon, coord_line[i])
+                    else:
+                        rp = self._gs2d_1CHW(rpl[i], coord_plane[i])
+                        rl = self._gs1d_1CL1(rln[i], coord_line[i])
+                    
+                    rfeat_comps.extend([rp, rl])
+                
+                rfeat = torch.cat(rfeat_comps, dim=1)
                 g = self._interior_gate(xyz)  # [N,1]
                 feat = feat + g * rfeat
 
+        # Ensure basis compatibility
         self._ensure_basis_for_feat(patch, feat.shape[1])
 
+        # Project to appearance
         if 'mix_W' in patch and 'basis_B' in patch:
-            # feat_raw: [N, in_dim]
-            # W: [r, in_dim] → (W @ feat_raw^T)^T = [N, r]
             mid = torch.matmul(feat, patch['mix_W'].T)  # [N, r]
             out = patch['basis_B'](mid)  # [N, app_dim]
         else:
-            out = patch['basis_mat'](feat)  # (N, app_dim)
+            out = patch['basis_mat'](feat)  # [N, app_dim]
 
-        # seam blending near patch faces (inference-time smoothing, no extra params/loss)
+        # Seam blending
         out = self._blend_with_neighbors_if_needed(patch, xyz, out, kind="app")
         return out
-
 
     def compute_density_patchwise_fast(self, xyz, patch_coords):
         """
