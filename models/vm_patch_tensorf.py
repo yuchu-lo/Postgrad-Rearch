@@ -114,54 +114,45 @@ class TensorVMSplitPatch(TensorBase):
         self.seam_rank_app        = int(kargs.pop("seam_rank_app", 8))
 
         self.repair_enable            = bool(kargs.pop("repair_enable", True))
-        self.repair_tau               = float(kargs.pop("repair_tau", 1.0))               # L∞ distance threshold 0~1 (normalized at base-grid cell center)
-        self.repair_adjacent_only     = bool(kargs.pop("repair_adjacent_only", True))     # only L∞=1 neighbor cell is allowed
+        self.repair_tau               = float(kargs.pop("repair_tau", 1.0))
+        self.repair_adjacent_only     = bool(kargs.pop("repair_adjacent_only", True))
         self.repair_grad_scale_sigma  = float(kargs.pop("repair_grad_scale_sigma", 0.0))
         self.repair_grad_scale_app    = float(kargs.pop("repair_grad_scale_app", 0.3))
 
-        self.split_child_res_policy = str(kargs.pop("split_child_res_policy", "arg"))     # "arg"|"half"|"scale"
-        self.split_child_scale      = float(kargs.pop("split_child_scale", 1.0))          # 僅當 policy="scale" 時生效
-        self.split_child_min        = int(kargs.pop("split_child_min", 16))               # 子 patch 每軸的最小 res 下限
+        self.split_child_res_policy = str(kargs.pop("split_child_res_policy", "arg"))
+        self.split_child_scale      = float(kargs.pop("split_child_scale", 1.0))
+        self.split_child_min        = int(kargs.pop("split_child_min", 16))
         
-        self.global_basis_enable = bool(kargs.pop("global_basis_enable", True))
+        self.global_basis_enable = bool(kargs.pop("global_basis_enable", False))
         self.global_basis_k_sigma = int(kargs.pop("global_basis_k_sigma", 64))
         self.global_basis_k_app   = int(kargs.pop("global_basis_k_app", 96))
         
-        # Cache for global basis (key: (res_tuple, type, axis))
-        if not hasattr(self, '_global_basis_cache'):
-            self._global_basis_cache = {}
-        
-        print(f"[Shared Basis] enabled={self.global_basis_enable}, K_sigma={self.global_basis_k_sigma}, K_app={self.global_basis_k_app}")
-        
-        super().__init__(aabb, gridSize, device, **kargs)
-
-        self.patch_map = {}  # (i,j,k) -> patch dict
-        self.patch_grid_reso = patch_grid_reso  # totally (patch_grid_reso)^3 patches
-
-        self.basis_dtype = getattr(self, "basis_dtype", torch.float32)
-        self.use_shared_basis = bool(kargs.get("use_shared_basis", True))
-        if self.use_shared_basis:
-            n_basis_app = int(kargs.get("global_basis_k_app", 96))
-            self.shared_basis_manager = SharedBasisManager(
-                n_basis=n_basis_app,
-                app_dim=self.app_dim,
-                device=device,
-                dtype=torch.float32
-            )
-            print(f"[INFO] Using SharedBasisManager with {n_basis_app} basis vectors")
-        else:
-            self._basis_bank = torch.nn.ModuleDict()
-            self._basis_registry = {}
-
-        gate_dtype = self.aabb.dtype if hasattr(self, "aabb") else torch.get_default_dtype()
-        self.register_buffer("alpha_gate_scale", torch.ones((), dtype=gate_dtype))
-
+        self.patch_map = {}
+        self.patch_grid_reso = patch_grid_reso
+        self._basis_bank = torch.nn.ModuleDict()
+        self._basis_registry = {}
         self._seam_banks = torch.nn.ModuleDict()
         self._last_rank_resize_iter = None
-
+        
+        super().__init__(aabb, gridSize, device, **kargs)
+        
+        self.basis_dtype = getattr(self, "basis_dtype", torch.float32)
+        
+        if self.global_basis_enable:
+            self.shared_basis_manager = SharedBasisManager(
+                n_basis=self.global_basis_k_app,
+                app_dim=self.app_dim,  
+                device=device,
+                dtype=self.basis_dtype
+            )
+            print(f"[INFO] Using SharedBasisManager with {self.global_basis_k_app} basis vectors")
+        
+        gate_dtype = self.aabb.dtype  
+        self.register_buffer("alpha_gate_scale", torch.ones((), dtype=gate_dtype))
+        
         for pid, p in self.patch_map.items():
             self._validate_one_patch_shapes(f"{pid[0]}_{pid[1]}_{pid[2]}", p)
-
+    
     @staticmethod
     def _grad_scale(x, g):
         # g could be float or tensor; only grad changes and forward value does not
