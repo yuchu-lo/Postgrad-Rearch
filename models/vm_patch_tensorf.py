@@ -11,68 +11,102 @@ from contextlib import contextmanager
 from typing import Optional, Sequence, List, Tuple, Dict, Any
 
 class SharedBasisManager(torch.nn.Module):
-    """
-    全域共享基底管理器
-    每個 patch 只需學習係數，共享全域基底以節省記憶體
-    """
-    def __init__(self, n_basis=128, app_dim=27, device='cuda', dtype=torch.float32):
+    def __init__(self, mode='global', n_basis=128, app_dim=27, 
+                 device='cuda', dtype=torch.float32, 
+                 sparsity_reg=0.01, adaptive=True):
         super().__init__()
+        self.mode = mode  # 'global', 'shared', 'hybrid'
         self.n_basis = n_basis
         self.app_dim = app_dim
         self.device = device
         self.dtype = dtype
+        self.sparsity_reg = sparsity_reg
+        self.adaptive = adaptive
         
-        # 全域共享基底
-        self.global_basis = torch.nn.Linear(n_basis, app_dim, bias=False, device=device, dtype=dtype)
-        torch.nn.init.orthogonal_(self.global_basis.weight)  # 正交初始化
-        
-        # 每個 patch 的係數矩陣
-        self.patch_coeffs = torch.nn.ModuleDict()
-        
-    def get_or_create_coeffs(self, patch_key, in_dim):
-        """獲取或創建 patch 的係數矩陣"""
-        key_str = f"{patch_key[0]}_{patch_key[1]}_{patch_key[2]}"
-        
-        if key_str not in self.patch_coeffs:
-            coeffs = torch.nn.Linear(in_dim, self.n_basis, bias=False, 
-                                     device=self.device, dtype=self.dtype)
-            torch.nn.init.xavier_uniform_(coeffs.weight, gain=0.1)
-            self.patch_coeffs[key_str] = coeffs
+        if mode == 'global':
+            # 全域共享基底（方案 A）
+            self.global_basis = torch.nn.Linear(n_basis, app_dim, bias=False)
+            torch.nn.init.orthogonal_(self.global_basis.weight)
+            self.patch_coeffs = torch.nn.ModuleDict()
             
-        return self.patch_coeffs[key_str]
+        elif mode == 'shared':
+            # 維度共享（方案 B）
+            self._basis_bank = torch.nn.ModuleDict()
+            self._basis_registry = {}
+            
+        elif mode == 'hybrid':
+            # 混合模式：小 patches 用全域，大 patches 用獨立
+            self.global_basis = torch.nn.Linear(n_basis, app_dim, bias=False)
+            torch.nn.init.orthogonal_(self.global_basis.weight)
+            self.patch_coeffs = torch.nn.ModuleDict()
+            self._basis_bank = torch.nn.ModuleDict()
     
-    def forward(self, patch_key, vm_features):
+    def get_or_create_basis(self, patch_key, in_dim, patch_info=None):
         """
-        前向傳播：VM features -> coefficients -> global basis
-        Args:
-            patch_key: (i,j,k) tuple
-            vm_features: [N, in_dim] VM 特徵
-        Returns:
-            [N, app_dim] 最終 appearance 特徵
+        統一介面，根據模式返回適當的 basis
+        patch_info 可包含：res, importance, depth 等
         """
-        in_dim = vm_features.shape[-1]
-        coeffs_layer = self.get_or_create_coeffs(patch_key, in_dim)
-        
-        # 投影到基底空間
-        coeffs = coeffs_layer(vm_features)  # [N, n_basis]
-        
-        # 應用全域基底
-        output = self.global_basis(coeffs)  # [N, app_dim]
-        
-        return output
+        if self.mode == 'global':
+            return GlobalBasisWrapper(self, patch_key, in_dim)
+        elif self.mode == 'shared':
+            return self._get_shared_basis(in_dim, self.app_dim)
+        elif self.mode == 'hybrid':
+            # 根據 patch 特性決定
+            if patch_info and min(patch_info.get('res', [32,32,32])) < 32:
+                return GlobalBasisWrapper(self, patch_key, in_dim)
+            else:
+                return self._get_shared_basis(in_dim, self.app_dim)
     
-    def cleanup_unused(self, active_keys):
-        """清理未使用的係數矩陣"""
-        active_set = {f"{k[0]}_{k[1]}_{k[2]}" for k in active_keys}
-        to_remove = []
-        for key_str in self.patch_coeffs.keys():
-            if key_str not in active_set:
-                to_remove.append(key_str)
+    def compute_sparsity_loss(self):
+        """計算係數稀疏性損失（用於正則化）"""
+        if self.mode != 'global' or not self.patch_coeffs:
+            return 0.0
         
-        for key_str in to_remove:
-            del self.patch_coeffs[key_str]
+        total_loss = 0.0
+        for coeffs in self.patch_coeffs.values():
+            # L1 正則化促進稀疏性
+            total_loss += coeffs.weight.abs().mean() * self.sparsity_reg
+        return total_loss
+    
+    def prune_basis(self, threshold=0.01):
+        """剪枝不重要的基底維度"""
+        if self.mode == 'global':
+            # 分析所有係數，找出不常用的基底
+            importance = torch.zeros(self.n_basis)
+            for coeffs in self.patch_coeffs.values():
+                importance += coeffs.weight.abs().sum(dim=0)
+            
+            # 保留重要的基底
+            keep_mask = importance > threshold
+            # ... 實作剪枝邏輯
+    
+class GlobalBasisWrapper(torch.nn.Module):
+    """包裝器，讓全域基底用起來像普通的 Linear layer"""
+    def __init__(self, manager, patch_key, in_dim):
+        super().__init__()
+        self.manager = manager
+        self.patch_key = patch_key
+        self.in_features = in_dim
+        self.out_features = manager.app_dim
         
-        return len(to_remove)
+        # 獲取或創建係數層
+        key_str = f"{patch_key[0]}_{patch_key[1]}_{patch_key[2]}"
+        if key_str not in manager.patch_coeffs:
+            coeffs = torch.nn.Linear(in_dim, manager.n_basis, bias=False)
+            torch.nn.init.xavier_uniform_(coeffs.weight, gain=0.1)
+            manager.patch_coeffs[key_str] = coeffs
+        self.coeffs = manager.patch_coeffs[key_str]
+    
+    def forward(self, x):
+        # VM features → coefficients → global basis
+        coeff = self.coeffs(x)  # [N, n_basis]
+        return self.manager.global_basis(coeff)  # [N, app_dim]
+    
+    @property
+    def weight(self):
+        # 為了相容性，返回組合後的有效權重
+        # W_effective = W_coeffs @ W_basis
+        return self.manager.global_basis.weight @ self.coeffs.weight
 
 class _SeamLR2D(torch.nn.Module):
     def __init__(self, C, H, W, k, device=None, dtype=None):
@@ -101,6 +135,7 @@ class _SeamLR1D(torch.nn.Module):
 class TensorVMSplitPatch(TensorBase):
     def __init__(self, aabb, gridSize, device, patch_grid_reso=8, **kargs):
         self.use_shared_basis     = bool(kargs.pop("use_shared_basis", True))
+        basis_mode                = kargs.pop("basis_mode", "global")  # 'global', 'shared', 'hybrid'
         self.n_basis              = int(kargs.pop("n_basis", 128))
         self.global_basis_enable  = bool(kargs.pop("global_basis_enable", False))
         self.global_basis_k_sigma = int(kargs.pop("global_basis_k_sigma", 64))
@@ -117,15 +152,15 @@ class TensorVMSplitPatch(TensorBase):
         self.seam_rank_sigma      = int(kargs.pop("seam_rank_sigma", 8))
         self.seam_rank_app        = int(kargs.pop("seam_rank_app", 8))
 
-        self.repair_enable            = bool(kargs.pop("repair_enable", True))
-        self.repair_tau               = float(kargs.pop("repair_tau", 1.0))
-        self.repair_adjacent_only     = bool(kargs.pop("repair_adjacent_only", True))
-        self.repair_grad_scale_sigma  = float(kargs.pop("repair_grad_scale_sigma", 0.0))
-        self.repair_grad_scale_app    = float(kargs.pop("repair_grad_scale_app", 0.3))
+        self.repair_enable           = bool(kargs.pop("repair_enable", True))
+        self.repair_tau              = float(kargs.pop("repair_tau", 1.0))
+        self.repair_adjacent_only    = bool(kargs.pop("repair_adjacent_only", True))
+        self.repair_grad_scale_sigma = float(kargs.pop("repair_grad_scale_sigma", 0.0)) 
+        self.repair_grad_scale_app   = float(kargs.pop("repair_grad_scale_app", 0.3))
 
-        self.split_child_res_policy = str(kargs.pop("split_child_res_policy", "arg"))
-        self.split_child_scale      = float(kargs.pop("split_child_scale", 1.0))
-        self.split_child_min        = int(kargs.pop("split_child_min", 16))
+        self.split_child_res_policy  = str(kargs.pop("split_child_res_policy", "arg"))
+        self.split_child_scale       = float(kargs.pop("split_child_scale", 1.0))
+        self.split_child_min         = int(kargs.pop("split_child_min", 16))
         
         self.patch_map = {}
         self.patch_grid_reso = patch_grid_reso
@@ -136,8 +171,10 @@ class TensorVMSplitPatch(TensorBase):
         self._seam_banks = torch.nn.ModuleDict()
         self.basis_dtype = getattr(self, "basis_dtype", torch.float32)
         
-        if not hasattr(self, 'shared_basis_manager'):
-            self.shared_basis_manager = SharedBasisManager(use_shared=getattr(self, 'use_shared_basis', True))
+        self.shared_basis_manager = SharedBasisManager(mode=basis_mode, n_basis=self.n_basis, app_dim=self.app_dim,
+                                                       device=device, dtype=self.basis_dtype,
+                                                       sparsity_reg=kargs.pop("basis_sparsity_reg", 0.01),
+                                                       adaptive=kargs.pop("basis_adaptive", True))
         
         gate_dtype = self.aabb.dtype  
         self.register_buffer("alpha_gate_scale", torch.ones((), dtype=gate_dtype))
@@ -2580,11 +2617,9 @@ class TensorVMSplitPatch(TensorBase):
         child['depth'] = int(parent_patch.get('depth', 0)) + 1
         return child
 
-    def get_shared_basis(self, in_dim, out_dim):
-        if hasattr(self, 'shared_basis_manager'):
-            return self.shared_basis_manager.get_or_create_basis(in_dim, out_dim)
-        else:
-            return torch.nn.Linear(in_dim, out_dim, bias=False)
+    def get_shared_basis(self, patch_key, in_dim, patch_info=None):
+        """獲取 basis（全域或共享）"""
+        return self.shared_basis_manager.get_or_create_basis(patch_key, in_dim, patch_info)
 
     def _app_in_dim_from_planes(self, app_plane_list):
         return int(sum(p.shape[1] for p in app_plane_list))
