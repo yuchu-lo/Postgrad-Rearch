@@ -100,8 +100,12 @@ class _SeamLR1D(torch.nn.Module):
 
 class TensorVMSplitPatch(TensorBase):
     def __init__(self, aabb, gridSize, device, patch_grid_reso=8, **kargs):
-        self.basis_lowrank_enable = bool(kargs.pop("basis_lowrank_enable", False))
-        self.basis_rank           = int(kargs.pop("basis_rank", 16))
+        self.use_shared_basis     = bool(kargs.pop("use_shared_basis", True))
+        self.n_basis              = int(kargs.pop("n_basis", 128))
+        self.global_basis_enable  = bool(kargs.pop("global_basis_enable", False))
+        self.global_basis_k_sigma = int(kargs.pop("global_basis_k_sigma", 64))
+        self.global_basis_k_app   = int(kargs.pop("global_basis_k_app", 96))
+
         self.rank_cap_sigma       = kargs.pop("rank_cap_sigma", None)
         self.rank_cap_app         = kargs.pop("rank_cap_app", None)
         self.rank_base_floor_sig  = kargs.pop("rank_base_floor_sig", None)
@@ -123,13 +127,8 @@ class TensorVMSplitPatch(TensorBase):
         self.split_child_scale      = float(kargs.pop("split_child_scale", 1.0))
         self.split_child_min        = int(kargs.pop("split_child_min", 16))
         
-        self.global_basis_enable = bool(kargs.pop("global_basis_enable", False))
-        self.global_basis_k_sigma = int(kargs.pop("global_basis_k_sigma", 64))
-        self.global_basis_k_app   = int(kargs.pop("global_basis_k_app", 96))
-        
         self.patch_map = {}
         self.patch_grid_reso = patch_grid_reso
-        self._basis_registry = {}
         self._last_rank_resize_iter = None
         
         super().__init__(aabb, gridSize, device, **kargs)
@@ -137,14 +136,9 @@ class TensorVMSplitPatch(TensorBase):
         self._seam_banks = torch.nn.ModuleDict()
         self.basis_dtype = getattr(self, "basis_dtype", torch.float32)
         
-        if self.global_basis_enable:
-            self.shared_basis_manager = SharedBasisManager(
-                n_basis=self.global_basis_k_app,
-                app_dim=self.app_dim,  
-                device=device,
-                dtype=self.basis_dtype
-            )
-            print(f"[INFO] Using SharedBasisManager with {self.global_basis_k_app} basis vectors")
+        if self.use_shared_basis:
+            self.shared_basis_manager = SharedBasisManager(n_basis=self.n_basis, app_dim=self.app_dim, device=device, dtype=self.basis_dtype)
+            print(f"[INFO] Using SharedBasisManager with {self.n_basis} basis vectors")
         
         gate_dtype = self.aabb.dtype  
         self.register_buffer("alpha_gate_scale", torch.ones((), dtype=gate_dtype))
@@ -565,11 +559,7 @@ class TensorVMSplitPatch(TensorBase):
         patch['app_line']      = _to_paramlist(patch['app_line'])
 
         if 'basis_mat' in patch and isinstance(patch['basis_mat'], torch.nn.Module):
-            patch['basis_mat'] = patch['basis_mat'].to(device)
-        if 'basis_B' in patch and isinstance(patch['basis_B'], torch.nn.Module):
-            patch['basis_B'] = patch['basis_B'].to(device)
-        if 'mix_W' in patch and isinstance(patch['mix_W'], torch.nn.Parameter):
-            patch['mix_W'] = torch.nn.Parameter(patch['mix_W'].detach().to(device), requires_grad=True)
+           patch['basis_mat'] = patch['basis_mat'].to(device)
 
         return patch
 
@@ -581,9 +571,6 @@ class TensorVMSplitPatch(TensorBase):
             plane_coef.append(torch.nn.Parameter(scale * torch.randn((1, n_component[i], gridSize[mat_id_1], gridSize[mat_id_0]), device=device)))
             line_coef.append(torch.nn.Parameter(scale * torch.randn((1, n_component[i], gridSize[vec_id], 1), device=device)))
         return torch.nn.ParameterList(plane_coef), torch.nn.ParameterList(line_coef)
-
-    def _init_basis_mat(self):
-        return torch.nn.Linear(sum(self.app_n_comp), self.app_dim, bias=False)
     
     def _create_patch(self, res, device):
         gridSize = list(res)
@@ -631,21 +618,7 @@ class TensorVMSplitPatch(TensorBase):
                 'app_plane':     app_plane,
                 'app_line':      app_line,
             }
-        
-        # Appearance basis (unchanged)
-        in_dim = self._app_in_dim_from_vm_or_coef(patch)
-        
-        if getattr(self, "basis_lowrank_enable", False):
-            r = int(getattr(self, "basis_rank", 16))
-            mix_W = torch.nn.Parameter(0.01 * torch.randn(r, in_dim, device=device), requires_grad=True)
-            basis_B = self.get_shared_basis(r, self.app_dim)
-            patch['mix_W']  = mix_W
-            patch['basis_B'] = basis_B
-        else:
-            basis = self.get_shared_basis(in_dim, self.app_dim)
-            patch['basis_mat'] = basis
 
-        # Residuals (if enabled)
         if bool(getattr(self, "enable_child_residual", True)):
             if not self.global_basis_enable:
                 def _zeros_like_pl(pl):
@@ -656,24 +629,6 @@ class TensorVMSplitPatch(TensorBase):
                 patch['density_line_res']  = _zeros_like_pl(patch['density_line'])
                 patch['app_plane_res']     = _zeros_like_pl(patch['app_plane'])
                 patch['app_line_res']      = _zeros_like_pl(patch['app_line'])
-            else:
-                # Residuals also use coefficients
-                patch['density_plane_res'] = torch.nn.ParameterList([
-                    torch.nn.Parameter(torch.zeros(self.density_n_comp[i], K_sigma, device=device))
-                    for i in range(3)
-                ])
-                patch['density_line_res'] = torch.nn.ParameterList([
-                    torch.nn.Parameter(torch.zeros(self.density_n_comp[i], K_sigma, device=device))
-                    for i in range(3)
-                ])
-                patch['app_plane_res'] = torch.nn.ParameterList([
-                    torch.nn.Parameter(torch.zeros(self.app_n_comp[i], K_app, device=device))
-                    for i in range(3)
-                ])
-                patch['app_line_res'] = torch.nn.ParameterList([
-                    torch.nn.Parameter(torch.zeros(self.app_n_comp[i], K_app, device=device))
-                    for i in range(3)
-                ])
 
         return patch
 
@@ -796,7 +751,9 @@ class TensorVMSplitPatch(TensorBase):
         Create a uniform patch grid of shape `grid_reso` (Gx,Gy,Gz).
         Each patch holds its own VM tensors at per-patch resolution `vm_reso`.
         """
-        print(f"[basis] bank size = {len(self._basis_bank)} | keys = {list(self._basis_bank.keys())[:4]}...")
+        if self.use_shared_basis:
+           print(f"[INFO] Creating uniform patches with SharedBasisManager")
+
         Gx, Gy, Gz = map(int, grid_reso)
         Rx, Ry, Rz = map(int, vm_reso)
         dev = self.aabb.device
@@ -819,18 +776,6 @@ class TensorVMSplitPatch(TensorBase):
                         'app_plane':     _clone_pl(template['app_plane']),
                         'app_line':      _clone_pl(template['app_line']),
                     }
-
-                    # 基底：對齊 template 的路徑
-                    if 'basis_mat' in template:
-                        in_dim = self._app_in_dim_from_vm(p['app_plane'], p['app_line'])
-                        p['basis_mat'] = self.get_shared_basis(in_dim, self.app_dim)
-                    else:
-                        # 低秩共享：新建 per-patch mix_W，basis_B 使用共享 bank
-                        r = int(getattr(self, "basis_rank", 16))
-                        in_dim = self._app_in_dim_from_vm(p['app_plane'], p['app_line'])
-                        p['mix_W']  = torch.nn.Parameter(0.01 * torch.randn(r, in_dim, device=dev), requires_grad=True)
-                        p['basis_B'] = self.get_shared_basis(r, self.app_dim)
-
                     new_map[(i, j, k)] = p
 
         self.patch_map = new_map
@@ -1129,30 +1074,23 @@ class TensorVMSplitPatch(TensorBase):
                 g = self._interior_gate(xyz)  # [N,1]
                 feat = feat + g * rfeat
 
-        self._ensure_basis_for_feat(patch, feat.shape[1])
-
-        patch_key = patch.get("_key", (0, 0, 0))
-
-        if use_shared_basis and hasattr(self, 'shared_basis_manager'):
-            # 獲取 patch key
+        if self.use_shared_basis and hasattr(self, 'shared_basis_manager'):
             patch_key = patch.get("_key", None)
             if patch_key is None:
-                # 嘗試從 patch 反推 key
+                # 嘗試從 patch_map 反推 key
                 for k, v in self.patch_map.items():
                     if v is patch:
                         patch_key = k
                         break
                 if patch_key is None:
                     patch_key = (0, 0, 0)  # fallback
-            
             out = self.shared_basis_manager(patch_key, feat)
-        elif 'mix_W' in patch and 'basis_B' in patch:
-            # 低秩分解路徑
-            mid = torch.matmul(feat, patch['mix_W'].T)
-            out = patch['basis_B'](mid)
         else:
-            # 確保 basis_mat 存在
-            self._ensure_basis_for_feat(patch, feat.shape[1])
+            # Fallback: 每個 patch 有自己的投影矩陣
+            if 'basis_mat' not in patch:
+                in_dim = feat.shape[1]
+                patch['basis_mat'] = torch.nn.Linear(in_dim, self.app_dim, bias=False, device=feat.device)
+                torch.nn.init.xavier_uniform_(patch['basis_mat'].weight)
             out = patch['basis_mat'](feat)
 
         out = self._blend_with_neighbors_if_needed(patch, xyz, out, kind="app")
@@ -2228,21 +2166,6 @@ class TensorVMSplitPatch(TensorBase):
     def _app_in_dim_from_vm(self, app_plane_list, app_line_list):
         """正確的 app 特徵輸入維度 = 3 個 planes 的 C 總和 + 3 條 lines 的 C 總和"""
         return int(sum(p.shape[1] for p in app_plane_list) + sum(l.shape[1] for l in app_line_list))
-
-    def _ensure_basis_for_feat(self, patch: dict, feat_dim: int):
-        # basis_lowrank_enable=True -> skip if lowrank processing mode
-        if 'mix_W' in patch and 'basis_B' in patch:
-            return
-
-        lin = patch.get('basis_mat', None)
-        if lin is None:
-            patch['basis_mat'] = self.get_shared_basis(feat_dim, self.app_dim)
-            return
-        if getattr(lin, 'in_features', None) != int(feat_dim):
-            if hasattr(self, '_rebuild_basis_like'):
-                patch['basis_mat'] = self._rebuild_basis_like(lin, int(feat_dim))
-            else:
-                patch['basis_mat'] = self.get_shared_basis(int(feat_dim), self.app_dim)
 
     @classmethod
     def _gs2d_by_grid(cls, plane_1CHW: torch.Tensor, grid_1HW2: torch.Tensor) -> torch.Tensor:
