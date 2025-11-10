@@ -1424,17 +1424,22 @@ class TensorVMSplitPatch(TensorBase):
         
         return changed
 
-
-
-
     @torch.no_grad()
-    def strict_evenize_once(self, target_G, vm_reso):
+    def strict_evenize_once(self, target_G, vm_reso, use_progressive=True, iteration=0):
         """
         Only change patch grid res here, keeping VM res per-patch.
+        If use_progressive=True, use progressive resolution based on iteration and patch importance.
         """
         device = self.aabb.device
         Gx, Gy, Gz = map(int, target_G)
-        R = list(vm_reso)
+        
+        # 如果啟用漸進式解析度，根據迭代次數調整基礎解析度
+        if use_progressive:
+            base_R = list(self.get_progressive_resolution(iteration, patch_importance=0.5))
+            print(f"[PPR] Using progressive resolution: {base_R} at iteration {iteration}")
+        else:
+            R = list(vm_reso)
+            base_R = R
 
         if not self.patch_map:
             self.ensure_default_patch()
@@ -1452,12 +1457,33 @@ class TensorVMSplitPatch(TensorBase):
             for j in range(Gy):
                 for k in range(Gz):
                     key = (i, j, k)
+                    
+                    # 如果啟用漸進式，根據 patch 重要性調整解析度
+                    if use_progressive and key in self.patch_map:
+                        patch_importance = self.patch_map[key].get('alpha_mass', 0.5)
+                        R = list(self.get_progressive_resolution(iteration, patch_importance))
+                    else:
+                        R = base_R[:]
+                    
                     if key in self.patch_map:
                         p = self._ensure_patch_device(self.patch_map[key], device)
-                        p['res'] = R[:]                    
+                        
+                        # 如果解析度改變，需要 upsample/downsample
+                        src_R = list(p.get('res', R))
+                        if tuple(src_R) != tuple(R):
+                            print(f"[PPR] Patch {key}: {src_R} -> {R}")
+                            dpl, dln = self.upsample_VM(p["density_plane"], p["density_line"], R)
+                            apl, aln = self.upsample_VM(p["app_plane"], p["app_line"], R)
+                            p["density_plane"] = dpl
+                            p["density_line"] = dln
+                            p["app_plane"] = apl
+                            p["app_line"] = aln
+                        
+                        p['res'] = R[:]
                         new_map[key] = p
                         continue
 
+                    # 創建新 patch（從最近鄰居複製）
                     q = torch.tensor([[i, j, k]], dtype=torch.long, device=device)
                     nn_idx  = self._cheby_nearest_keys(keys_t, q).item()
                     src_key = cur_keys[nn_idx]
@@ -1468,22 +1494,22 @@ class TensorVMSplitPatch(TensorBase):
                     src_R = list(src.get('res', R))
                     if tuple(src_R) != tuple(R):
                         dpl, dln = self.upsample_VM(src["density_plane"], src["density_line"], R)
-                        apl, aln = self.upsample_VM(src["app_plane"],     src["app_line"],     R)
+                        apl, aln = self.upsample_VM(src["app_plane"], src["app_line"], R)
                         new_patch["density_plane"] = dpl
-                        new_patch["density_line"]  = dln
-                        new_patch["app_plane"]     = apl
-                        new_patch["app_line"]      = aln
+                        new_patch["density_line"] = dln
+                        new_patch["app_plane"] = apl
+                        new_patch["app_line"] = aln
                     else:
                         new_patch["density_plane"] = _clone_pl(src["density_plane"])
-                        new_patch["density_line"]  = _clone_pl(src["density_line"])
-                        new_patch["app_plane"]     = _clone_pl(src["app_plane"])
-                        new_patch["app_line"]      = _clone_pl(src["app_line"])
+                        new_patch["density_line"] = _clone_pl(src["density_line"])
+                        new_patch["app_plane"] = _clone_pl(src["app_plane"])
+                        new_patch["app_line"] = _clone_pl(src["app_line"])
 
                     if "basis_mat" in src:
                         new_in  = self._app_in_dim_from_vm(new_patch["app_plane"], new_patch["app_line"])
                         new_patch["basis_mat"] = self.get_shared_basis(new_in, self.app_dim)
+                    
                     new_patch["res"] = R[:]
-
                     new_map[key] = self._ensure_patch_device(new_patch, device)
 
         self.patch_map = new_map
@@ -1492,8 +1518,11 @@ class TensorVMSplitPatch(TensorBase):
         self.base_patch_grid_reso = tuple(target_G)
         self.patch_grid_reso = (Gx, Gy, Gz)
         self.current_patch_keys = list(self.patch_map.keys())
-        self.gridSize = torch.LongTensor(R).to(device)
-        self.update_stepSize(R)
+        
+        # 更新 gridSize 為最大解析度
+        max_res = max(R)
+        self.gridSize = torch.LongTensor([max_res, max_res, max_res]).to(device)
+        self.update_stepSize([max_res, max_res, max_res])
 
         try:
             self.assert_zero_origin_and_contiguous()
