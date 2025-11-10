@@ -5,13 +5,13 @@ expname = exp_Wineholder_VMpatch_E2U
 basedir = ./log
 model_name = TensorVMSplitPatch
 
-n_iters = 50000
+n_iters = 10000
 batch_size = 2048
 
 vm_reso_max = 64 
 patch_cap = 96                  
-voxel_budget = 20000000
-vram_budget_MB = 6000
+voxel_budget = 64_000_000
+vram_budget_MB = 10240
 
 N_voxel_init = 2097156 # 128**3
 N_voxel_final = 27000000 # 300**3
@@ -36,12 +36,10 @@ critrn_lambda = 0.5
 logmargin_base = 1.05
 critrn_accept_ratio = 0.5
 critrn_refine_frac = 0.3
-
-puf_alpha_boundary = 0.4
-boundary_smooth_strength = 1.5
+puf_alpha_boundary = 0.5 
 
 N_vis = 5
-vis_every = 5000
+vis_every = 1000
 
 render_test = 1
 
@@ -50,7 +48,7 @@ n_factors_app = [48, 48, 48]
 
 selective_rank_autoscale = 128 
 rank_autoscale_alpha_keep_q = 0.6
-rank_autoscale_gamma = 0.4
+rank_autoscale_gamma = 0.4 
 
 shadingMode = MLP_Fea
 fea2denseAct = softplus
@@ -58,6 +56,8 @@ fea2denseAct = softplus
 view_pe = 2
 fea_pe = 2
 
+lr_init = 0.03  
+lr_decay_iters = 8000
 lr_upsample_reset = 0
 
 L1_weight_inital = 8e-5
