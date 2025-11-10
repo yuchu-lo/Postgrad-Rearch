@@ -239,9 +239,25 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
         if _uk in _up_cache:
             dp_up, dl_up, ap_up, al_up = _up_cache[_uk]
         else:
-            dp_up, dl_up = tensorf.upsample_VM(dp, dl, res_target)
-            ap_up, al_up = tensorf.upsample_VM(ap, al, res_target)
+            if getattr(args, 'use_progressive_resolution', False):
+                # 計算此 patch 的 PPR 目標解析度
+                patch_importance = p.get('alpha_mass', 0.5)
+                if hasattr(p, '_complexity_cache'):
+                    patch_complexity = p._complexity_cache
+                else:
+                    patch_complexity = tensorf.compute_patch_complexity(p)
+                    p._complexity_cache = patch_complexity
+                
+                ppr_target = tensorf.get_progressive_resolution(step, max(patch_importance, patch_complexity))
+                # 使用 PPR 目標但不超過 res_target
+                actual_target = tuple(min(p, r) for p, r in zip(ppr_target, res_target))
+            else:
+                actual_target = res_target
+            
+            dp_up, dl_up = tensorf.upsample_VM(dp, dl, actual_target)
+            ap_up, al_up = tensorf.upsample_VM(ap, al, actual_target)
             _up_cache[_uk] = (dp_up, dl_up, ap_up, al_up)
+
 
         mem_c = _patch_mem({"density_plane": dp,    "density_line": dl,
                             "app_plane":     ap,    "app_line":     al,
@@ -406,6 +422,14 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
         return (min(r) < min(res_target)) and headroom_vox and headroom_mem
 
     patch_keys = list(tensorf.patch_map.keys())
+    if getattr(args, 'use_progressive_resolution', False):
+        print("[uneven_critrn] Pre-computing patch complexity for PPR...")
+        for key, patch in tensorf.patch_map.items():
+            if not hasattr(patch, '_complexity_cache') or patch.get('_last_complexity_update', 0) < step - 1000:
+                complexity = tensorf.compute_patch_complexity(patch)
+                patch._complexity_cache = complexity
+                patch._last_complexity_update = step
+
     max_by_ratio = max(1, int(len(candidates) * frac))
     max_by_abs   = max(1, min(6, int(0.10 * max(1, len(patch_keys)))))
     split_budget = min(max_by_ratio, max_by_abs)
@@ -463,37 +487,60 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
 
     assert len(set(to_promote) & set(to_split)) == 0, "promote/split overlap"
 
-    # ----- apply VM upgrades (batched) -----
+    # ----- apply VM upgrades (batched with PPR) -----
     if len(to_promote) > 0:
-        # 獲取當前迭代和總迭代數
-        iteration = step
+        use_ppr = bool(getattr(args, 'use_progressive_resolution', False))
         
-        # 對每個要升級的 patch，使用漸進式解析度
-        actual_promoted = []
-        for key in to_promote:
-            patch = tensorf.patch_map[key]
-            importance = patch.get('alpha_mass', 0.5)
+        if use_ppr:
+            # 使用漸進式解析度，每個 patch 可能有不同的目標
+            actually_promoted = 0
+            for key in to_promote:
+                patch = tensorf.patch_map[key]
+                current_res = tuple(patch.get('res', [8, 8, 8]))
+                
+                # 根據 patch 重要性和複雜度獲取目標解析度
+                importance = patch.get('alpha_mass', 0.5)
+                
+                # 使用已計算的複雜度（如果有）
+                if hasattr(patch, '_complexity_cache'):
+                    complexity = patch._complexity_cache
+                else:
+                    complexity = tensorf.compute_patch_complexity(patch)
+                    patch._complexity_cache = complexity
+                
+                combined_score = max(importance, complexity)
+                
+                # 獲取 PPR 目標解析度
+                target_res_ppr = tensorf.get_progressive_resolution(step, combined_score)
+                
+                # 確保不超過全局 res_target
+                target_res_final = tuple(min(t, r) for t, r in zip(target_res_ppr, res_target))
+                
+                # 只有當目標解析度大於當前解析度時才升級
+                if any(t > c for t, c in zip(target_res_final, current_res)):
+                    print(f"[PUF-PPR] Patch {key}: {current_res} -> {target_res_final} (imp={importance:.3f}, comp={complexity:.3f})")
+                    
+                    # 執行 upsample
+                    dp_up, dl_up = tensorf.upsample_VM(patch["density_plane"], patch["density_line"], target_res_final)
+                    ap_up, al_up = tensorf.upsample_VM(patch["app_plane"], patch["app_line"], target_res_final)
+                    
+                    patch["density_plane"] = dp_up
+                    patch["density_line"] = dl_up
+                    patch["app_plane"] = ap_up
+                    patch["app_line"] = al_up
+                    patch["res"] = list(target_res_final)
+                    
+                    actually_promoted += 1
             
-            # 獲取漸進式目標解析度
-            target_res = tensorf.get_progressive_resolution(iteration, importance)
-            current_res = tuple(patch.get('res', [8, 8, 8]))
-            
-            # 只有當目標解析度大於當前解析度時才升級
-            if any(t > c for t, c in zip(target_res, current_res)):
-                actual_promoted.append(key)
-                print(f"[PUF-PPR] Patch {key}: {current_res} -> {target_res} (importance={importance:.3f})")
-        
-        # 批量升級
-        if actual_promoted:
+            n_ops += actually_promoted
+            print(f"[uneven_critrn] PPR VM-upgraded {actually_promoted} patches")
+        else:
+            # 原始邏輯：批量升級到固定解析度
             promoted = tensorf.upsample_patches(
-                actual_promoted, 
-                tuple(res_target),  # 這裡可以改為使用 PPR 的目標
-                mode="bilinear", 
-                align_corners=False, 
-                verbose=True
+                to_promote, tuple(res_target), mode="bilinear", align_corners=False, verbose=True
             )
             n_ops += int(promoted)
-            print(f"[uneven_critrn] VM-upgraded {promoted} patches with PPR")
+            print(f"[uneven_critrn] VM-upgraded {promoted} patches to {tuple(res_target)}")
 
     # ----- apply splits + build field-KD buffers (teacher = pre-split parent) -----
     if len(to_split) > 0:
@@ -589,15 +636,51 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
 
         # apply the real split (mutate patch_map)
         if (step >= args.split_warmup_iters) and (len(to_split) > 0):
+            use_ppr = bool(getattr(args, 'use_progressive_resolution', False))
             new_map = dict(tensorf.patch_map)
-            for key in to_split:  
-                parent   = new_map.pop(key)
-                old_res  = parent["res"]
-                children = tensorf.split_patch(key, parent, old_res)  # children keep parent's res
+            
+            for key in to_split:
+                parent = new_map.pop(key)
+                
+                if use_ppr:
+                    # 使用 PPR 決定子 patch 的解析度
+                    parent_importance = parent.get('alpha_mass', 0.5)
+                    
+                    # 獲取父 patch 複雜度
+                    if hasattr(parent, '_complexity_cache'):
+                        parent_complexity = parent._complexity_cache
+                    else:
+                        parent_complexity = tensorf.compute_patch_complexity(parent)
+                    
+                    # 子 patch 的目標解析度基於父 patch 的重要性和訓練進度
+                    child_res = tensorf.get_progressive_resolution(step, max(parent_importance, parent_complexity))
+                    
+                    # 確保子 patch 解析度合理
+                    parent_res = parent.get('res', [16, 16, 16])
+                    
+                    # 策略：子 patch 不應該比父 patch 小太多（最多減半）
+                    min_child_res = tuple(max(8, r // 2) for r in parent_res)
+                    child_res = tuple(max(c, m) for c, m in zip(child_res, min_child_res))
+                    
+                    # 也不應該比父 patch 大太多（最多 1.5 倍）
+                    max_child_res = tuple(min(64, int(r * 1.5)) for r in parent_res)
+                    child_res = tuple(min(c, m) for c, m in zip(child_res, max_child_res))
+                    
+                    print(f"[PPR-split] Parent {key} (res={parent_res}, imp={parent_importance:.3f}) -> children (res={child_res})")
+                else:
+                    # 原始邏輯：子 patch 保持父 patch 的解析度
+                    child_res = parent["res"]
+                
+                children = tensorf.split_patch(key, parent, child_res)
                 new_map.update(children)
+            
             tensorf.patch_map = new_map
             n_ops += len(to_split)
-            print(f"[uneven_critrn] split {len(to_split)} patches (children keep res={old_res})")
+            
+            if use_ppr:
+                print(f"[uneven_critrn] split {len(to_split)} patches with PPR-based resolution")
+            else:
+                print(f"[uneven_critrn] split {len(to_split)} patches (children keep parent res)")
 
             try:
                 tensorf._last_split_children = list(set(kd_records_children)) if kd_records_children else []
