@@ -698,17 +698,26 @@ class TensorVMSplitPatch(TensorBase):
     
     def _ensure_patch_device(self, patch, device):
         def _to_paramlist(pl):
-            return torch.nn.ParameterList([
-                torch.nn.Parameter(p.detach().to(device), requires_grad=True) for p in pl
-            ])
+            return torch.nn.ParameterList([torch.nn.Parameter(p.detach().to(device), requires_grad=True) for p in pl])
+        
         patch['density_plane'] = _to_paramlist(patch['density_plane'])
         patch['density_line']  = _to_paramlist(patch['density_line'])
         patch['app_plane']     = _to_paramlist(patch['app_plane'])
         patch['app_line']      = _to_paramlist(patch['app_line'])
 
         if 'basis_mat' in patch:
-           in_dim = self._app_in_dim_from_vm(patch['app_plane'], patch['app_line'])
-           patch['basis_mat'] = self.get_shared_basis(in_dim, self.app_dim)
+            in_dim = self._app_in_dim_from_vm(patch['app_plane'], patch['app_line'])
+            
+            patch_key = None
+            for key, p in self.patch_map.items():
+                if p is patch:
+                    patch_key = key
+                    break
+            
+            if patch_key is None:
+                patch_key = (0, 0, 0)
+
+            patch['basis_mat'] = self.get_shared_basis(patch_key, in_dim)
 
         return patch
 
@@ -1407,18 +1416,14 @@ class TensorVMSplitPatch(TensorBase):
                         R = base_R[:]
                     
                     if key in self.patch_map:
-                        p = self._ensure_patch_device(self.patch_map[key], device)
+                        p = self.patch_map[key]
+
+                        for name in ['density_plane', 'density_line', 'app_plane', 'app_line']:
+                            p[name] = _clone_pl(p[name])
                         
-                        # 如果解析度改變，需要 upsample/downsample
-                        src_R = list(p.get('res', R))
-                        if tuple(src_R) != tuple(R):
-                            print(f"[PPR] Patch {key}: {src_R} -> {R}")
-                            dpl, dln = self.upsample_VM(p["density_plane"], p["density_line"], R)
-                            apl, aln = self.upsample_VM(p["app_plane"], p["app_line"], R)
-                            p["density_plane"] = dpl
-                            p["density_line"] = dln
-                            p["app_plane"] = apl
-                            p["app_line"] = aln
+                        if 'basis_mat' in p:
+                            in_dim = self._app_in_dim_from_vm(p['app_plane'], p['app_line'])
+                            p['basis_mat'] = self.get_shared_basis(key, in_dim)
                         
                         p['res'] = R[:]
                         new_map[key] = p
@@ -1437,14 +1442,14 @@ class TensorVMSplitPatch(TensorBase):
                         dpl, dln = self.upsample_VM(src["density_plane"], src["density_line"], R)
                         apl, aln = self.upsample_VM(src["app_plane"], src["app_line"], R)
                         new_patch["density_plane"] = dpl
-                        new_patch["density_line"] = dln
-                        new_patch["app_plane"] = apl
-                        new_patch["app_line"] = aln
+                        new_patch["density_line"]  = dln
+                        new_patch["app_plane"]     = apl
+                        new_patch["app_line"]      = aln
                     else:
                         new_patch["density_plane"] = _clone_pl(src["density_plane"])
-                        new_patch["density_line"] = _clone_pl(src["density_line"])
-                        new_patch["app_plane"] = _clone_pl(src["app_plane"])
-                        new_patch["app_line"] = _clone_pl(src["app_line"])
+                        new_patch["density_line"]  = _clone_pl(src["density_line"])
+                        new_patch["app_plane"]     = _clone_pl(src["app_plane"])
+                        new_patch["app_line"]      = _clone_pl(src["app_line"])
                     
                     if "basis_mat" in src:
                         new_in = self._app_in_dim_from_vm(new_patch["app_plane"], new_patch["app_line"])
