@@ -11,7 +11,7 @@ from opt import config_parser
 from utils import *
 from dataLoader import dataset_dict
 from renderer_patch import PatchTrainStep, evaluation, evaluation_path
-from uneven_criterion_patch import uneven_critrn
+from uneven_criterion_patch import get_split_depth, estimate_patch_memory, uneven_critrn
 from patch_visualization_utils import export_patch_viz_bundle
 import json, shlex, shutil, subprocess
 from collections import defaultdict
@@ -2445,9 +2445,19 @@ def reconstruction(args):
                 prev_n = len(tensorf.patch_map)
                 miss_b = quick_miss_ratio(tensorf)
 
+                use_ppr = getattr(args, 'use_progressive_resolution', False)
+                if use_ppr:
+                    print(f"[strict-even] Using Progressive Patch Resolution")
+                    print(f"  - Iteration: {iteration}")
+                    print(f"  - Base resolution will be determined by progress")
+                    for key, patch in tensorf.patch_map.items():
+                        complexity = tensorf.compute_patch_complexity(patch)
+                        patch['_complexity_cache'] = complexity
+
                 print(f"========> STRICT-EVEN to G={STRICT_EVEN_TARGET_G} (keep VM={tuple(reso_cur)})")
                 tensorf.strict_evenize_once(target_G=STRICT_EVEN_TARGET_G, vm_reso=tuple(reso_cur),
-                                            use_progressive=True, iteration=iteration)
+                                            use_progressive=use_ppr, iteration=iteration)
+
                 tensorf.assert_zero_origin_and_contiguous()
                 tensorf.debug_dump_basis_stats()
 
@@ -2986,13 +2996,71 @@ def reconstruction(args):
 
                     before_res = sorted({tuple(p['res']) for p in tensorf.patch_map.values()})
 
-                    # top-K selected by certain ratio 
-                    sel_keys, eligible = tensorf.select_patches_by_alpha_mass(tuple(reso_target), ratio=ratio, topk=topk, min_k=min_k, max_k=max_k)
+                    sel_keys, eligible = tensorf.select_patches_by_alpha_mass(
+                        tuple(reso_target), ratio=ratio, topk=topk, min_k=min_k, max_k=max_k
+                    )
+
+                    # top-K selected by content complexity
+                    def content_aware_selection(tensorf, base_target, ratio, min_k, max_k):
+                        """根據內容複雜度決定每個 patch 的目標解析度"""
+                        candidates = []
+                        
+                        for key, patch in tensorf.patch_map.items():
+                            current_res = patch['res'][0]  # 假設各軸相同
+                            complexity = patch.get('content_complexity', 
+                                                patch.get('roughness', 0.5))
+                            alpha_mass = patch.get('alpha_mass', 0.0)
+                            
+                            # 根據複雜度決定目標解析度上限
+                            if complexity < 0.2:  # 平滑區域
+                                patch_target = min(current_res * 1.5, 64)
+                            elif complexity < 0.5:  # 中等複雜度
+                                patch_target = min(current_res * 2, 96)
+                            else:  # 高複雜度
+                                patch_target = min(current_res * 2, base_target[0])
+                            
+                            # 計算提升效益
+                            if patch_target > current_res:
+                                benefit = alpha_mass * complexity * (patch_target - current_res) / current_res
+                                candidates.append({
+                                    'key': key,
+                                    'target': (patch_target, patch_target, patch_target),
+                                    'benefit': benefit,
+                                    'complexity': complexity
+                                })
+                        
+                        # 按效益排序，選擇 top-k
+                        candidates.sort(key=lambda x: x['benefit'], reverse=True)
+                        
+                        # 動態決定選擇數量
+                        k = min(max_k, max(min_k, int(len(candidates) * ratio)))
+                        
+                        selected = candidates[:k]
+                        return selected
+
+                    # 使用新的選擇邏輯
+                    selected_patches = content_aware_selection(
+                        tensorf, reso_target, ratio, min_k, max_k
+                    )
+
                     log_event(logfolder, "vm-ups-select", iteration,
                               topk=(int(topk_arg) if topk_arg is not None else -1),
                               ratio=ratio, eligible=eligible, picked=len(sel_keys),
                               res_before=str(before_res),
                               target=str(reso_target))
+
+                    def get_resolution_cap_by_depth(key, grid_reso, base_max=128):
+                        """深度越深，允許的最大解析度越低"""
+                        depth = get_split_depth(key, grid_reso) 
+                        
+                        caps = {
+                            0: base_max,      # 未 split：128
+                            1: min(96, base_max),   # split 1次：96
+                            2: min(64, base_max),   # split 2次：64
+                            3: min(48, base_max),   # split 3次：48
+                        }
+                        
+                        return caps.get(depth, 32)
 
                     if len(sel_keys) == 0:
                         print("[per-patch upsample] no eligible patches this round; skip.")
@@ -3022,9 +3090,43 @@ def reconstruction(args):
 
                         pre_event_batch = int(getattr(args, "batch_size", 2048))
 
-                        # actually upgrade res in patches: top-K alpha-mass
+                        
                         adjust_batch_size(reso_target, args)
-                        n_promoted = tensorf.upsample_patches(sel_keys, tuple(reso_target), mode="bilinear", align_corners=False, verbose=True)
+
+                        def memory_safe_upsample(tensorf, selected_patches, budget_mb):
+                            """分批執行 upsample，避免 OOM"""
+                            current_mem = tensorf.get_total_mem()
+                            budget = budget_mb * 1024**2
+                            
+                            promoted = []
+                            for item in selected_patches:
+                                key = item['key']
+                                target_res = item['target']
+                                patch = tensorf.patch_map[key]
+                                
+                                # 估算記憶體增長
+                                current_res = patch['res'][0]
+                                delta_factor = (target_res[0] / current_res) ** 3
+                                patch_mem = estimate_patch_memory(patch)  
+                                delta_mem = patch_mem * (delta_factor - 1)
+                                
+                                if current_mem + delta_mem > budget * 0.9:
+                                    print(f"[VM-ups] Memory limit reached, promoted {len(promoted)}/{len(selected_patches)}")
+                                    break
+                                
+                                # actually upgrade res in patches
+                                success = tensorf.upsample_patches(
+                                    [key], target_res, mode="bilinear", 
+                                    align_corners=False, verbose=False
+                                )
+                                
+                                if success:
+                                    promoted.append(key)
+                                    current_mem += delta_mem
+                            
+                            return promoted
+
+                        n_promoted = len(memory_safe_upsample(tensorf, selected_patches, VRAM_BUDGET_MB))
 
                         _ = event_full_recover(tensorf, note="post-VM-upsample", iteration=iteration, reso_cur=reso_cur)
                         did_cov_this_step = True
