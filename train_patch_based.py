@@ -1719,15 +1719,6 @@ def reconstruction(args):
             if any(c > 0 for c in complexities):
                 print(f"[Debug] Complexity range: {min(complexities):.3f} - {max(complexities):.3f}")
 
-        if iteration % 100 == 0:  
-            exp_logger.log_iteration(
-                iteration=iteration,
-                psnr=PSNR,
-                memory_mb=tensorf.get_total_mem() / (1024**2),
-                n_patches=len(tensorf.patch_map),
-                total_voxels=tensorf.get_total_voxels()
-            )
-
         # pre-step warm-up: apply updated lr
         if maybe_warmup_hook is not None:
             maybe_warmup_hook(iteration) 
@@ -1753,7 +1744,7 @@ def reconstruction(args):
                 active_keys = list(tensorf.patch_map.keys())
                 removed = tensorf.shared_basis_manager.cleanup_unused(active_keys)
                 if removed > 0:
-                    print(f"[Cleanup] Removed {removed} unused basis coefficients")
+                    print(f"[Cleanup] Removed {removed} unused basis coefficient matrices")
 
             if hasattr(tensorf, '_kd_buffers') and len(tensorf._kd_buffers) > 10:
                 tensorf._kd_buffers = tensorf._kd_buffers[-10:]  # last 10 new 
@@ -2059,6 +2050,10 @@ def reconstruction(args):
             total_loss = total_loss + loss_tv_a
             reg_terms["tv_app"] = loss_tv_a
 
+        if hasattr(tensorf, 'shared_basis_manager'):
+            sparsity_loss = tensorf.shared_basis_manager.compute_sparsity_loss()
+            total_loss = total_loss + sparsity_loss
+
         if not torch.isfinite(total_loss):
             print("[WARN] total_loss is NaN/Inf. Skipping step.")
             optimizer.zero_grad(set_to_none=True)
@@ -2110,6 +2105,12 @@ def reconstruction(args):
         summary_writer.add_scalar('stats/total_voxels', n_vox, iteration)
         summary_writer.add_scalar('stats/total_memory_MB', mem_bytes / (1024 ** 2), iteration)
         summary_writer.add_scalar('stats/total_patches', len(tensorf.patch_map), iteration)
+        
+        if iteration % 100 == 0:  
+            exp_logger.log_iteration(iteration=iteration, psnr=PSNR,
+                                     memory_mb=tensorf.get_total_mem() / (1024**2),
+                                     n_patches=len(tensorf.patch_map),
+                                     total_voxels=tensorf.get_total_voxels())
 
         rd_every = int(getattr(args, "rd_every", 50))
         if (iteration % rd_every) == 0:
