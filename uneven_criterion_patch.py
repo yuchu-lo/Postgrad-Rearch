@@ -421,6 +421,9 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
         complexity_factor = 1.0 - complexity * 0.5  # 複雜區域 cost 降低最多 50%
         split_cost = split_cost * complexity_factor
 
+        p['roughness'] = rough_avg  
+        p['content_complexity'] = rough_avg * (1.0 if avg_gain > 0 else 0.5)  
+
         candidates.append({
             "key": key,
             "avg_margin": avg_margin,
