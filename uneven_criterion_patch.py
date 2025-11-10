@@ -88,20 +88,50 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
     max_mem = None
 
     # boundary cost proxy (per *current* patch; used for SPLIT ranking)
-    def _boundary_cost_proxy_for_split(patch, roughness_avg: float) -> float:
+    def _boundary_cost_proxy_for_split(patch, roughness_avg: float, tensorf=None) -> float:
+        """
+        改進的邊界成本，考慮內容複雜度
+        """
         if alpha_boundary <= 0.0:
             return 0.0
+        
         rx, ry, rz = [int(x) for x in patch.get("res", (0, 0, 0))]
+        
         if bcost_mode == "dof":
-            # dominant DOF at three internal mid-planes after 2x2x2 split
+            # 基礎 DOF：三個內部切面的自由度
             base = float(ry * rz + rx * rz + rx * ry)
         else:
-            # fallback: constant (not recommended)
             base = 1.0
-        # smooth regions should pay more boundary cost; clamp to [0,1]
+        
+        # 計算內容複雜度（使用 VM 分解的能量分布）
+        complexity = 1.0
+        if tensorf is not None:
+            # 計算 plane/line 的能量分布
+            density_energy = 0.0
+            app_energy = 0.0
+            
+            for i in range(3):
+                # Density 複雜度
+                d_plane = patch['density_plane'][i].detach()
+                d_line = patch['density_line'][i].detach()
+                density_energy += torch.std(d_plane).item() + torch.std(d_line).item()
+                
+                # App 複雜度
+                a_plane = patch['app_plane'][i].detach()
+                a_line = patch['app_line'][i].detach()
+                app_energy += torch.std(a_plane).item() + torch.std(a_line).item()
+            
+            # 正規化複雜度到 [0.5, 2.0]
+            complexity = 0.5 + min(1.5, (density_energy + app_energy) / 12.0)
+        
+        # 平滑因子：平滑區域懲罰更高（使用平方加強）
         rough = float(max(0.0, min(1.0, roughness_avg)))
-        smooth_factor = float(max(0.0, min(1.0, 1.0 - rough)))  # 1 at smooth, 0 at very high-frequency
-        return alpha_boundary * base * (bcost_smooth_strength * smooth_factor)
+        smooth_factor = (1.0 - rough) ** 2  # 平方加強平滑區域的懲罰
+        
+        # 最終成本
+        cost = alpha_boundary * base * (bcost_smooth_strength * smooth_factor) * complexity
+        
+        return cost
 
     # ----------------- build focus maps per view -----------------
     focus_map     = []  # focus_map[v] : dict[patch_key(tuple int,int,int)] -> LongTensor(ray_idx_for_view_v)
