@@ -2446,7 +2446,8 @@ def reconstruction(args):
                 miss_b = quick_miss_ratio(tensorf)
 
                 print(f"========> STRICT-EVEN to G={STRICT_EVEN_TARGET_G} (keep VM={tuple(reso_cur)})")
-                tensorf.strict_evenize_once(STRICT_EVEN_TARGET_G, reso_cur)
+                tensorf.strict_evenize_once(target_G=STRICT_EVEN_TARGET_G, vm_reso=tuple(reso_cur),
+                                            use_progressive=True, iteration=iteration)
                 tensorf.assert_zero_origin_and_contiguous()
                 tensorf.debug_dump_basis_stats()
 

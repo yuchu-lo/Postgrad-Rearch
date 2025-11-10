@@ -244,6 +244,16 @@ def config_parser(cmd=None):
     parser.add_argument('--miss_guard_thres', type=float, default=0.35,
                         help='threshold to trigger aggressive fill')
 
+    # ===== Progressive Patch Resolution =====
+    parser.add_argument('--use_progressive_resolution', type=_parse_bool, default=True,
+                        help='Use progressive patch resolution based on training progress')
+    parser.add_argument('--ppr_min_res', type=int, default=8,
+                        help='Minimum resolution for PPR')
+    parser.add_argument('--ppr_max_res', type=int, default=64,
+                        help='Maximum resolution for PPR')
+    parser.add_argument('--ppr_importance_threshold', type=float, default=0.7,
+                        help='Importance threshold for resolution boost in PPR')
+
     # ===== Uneven criterion =====
     parser.add_argument('--critrn_mode', type=str, default='hybrid',
                         choices=['split', 'vm', 'hybrid'],

@@ -463,15 +463,39 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
 
     assert len(set(to_promote) & set(to_split)) == 0, "promote/split overlap"
 
-    # ----------------- apply VM upgrades (batched) -----------------
+    # ----- apply VM upgrades (batched) -----
     if len(to_promote) > 0:
-        promoted = tensorf.upsample_patches(
-            to_promote, tuple(res_target), mode="bilinear", align_corners=False, verbose=True
-        )
-        n_ops += int(promoted)
-        print(f"[uneven_critrn] VM-upgraded {promoted} patches to {tuple(res_target)}")
+        # 獲取當前迭代和總迭代數
+        iteration = step
+        
+        # 對每個要升級的 patch，使用漸進式解析度
+        actual_promoted = []
+        for key in to_promote:
+            patch = tensorf.patch_map[key]
+            importance = patch.get('alpha_mass', 0.5)
+            
+            # 獲取漸進式目標解析度
+            target_res = tensorf.get_progressive_resolution(iteration, importance)
+            current_res = tuple(patch.get('res', [8, 8, 8]))
+            
+            # 只有當目標解析度大於當前解析度時才升級
+            if any(t > c for t, c in zip(target_res, current_res)):
+                actual_promoted.append(key)
+                print(f"[PUF-PPR] Patch {key}: {current_res} -> {target_res} (importance={importance:.3f})")
+        
+        # 批量升級
+        if actual_promoted:
+            promoted = tensorf.upsample_patches(
+                actual_promoted, 
+                tuple(res_target),  # 這裡可以改為使用 PPR 的目標
+                mode="bilinear", 
+                align_corners=False, 
+                verbose=True
+            )
+            n_ops += int(promoted)
+            print(f"[uneven_critrn] VM-upgraded {promoted} patches with PPR")
 
-    # ----------------- apply splits + build field-KD buffers (teacher = pre-split parent) -----------------
+    # ----- apply splits + build field-KD buffers (teacher = pre-split parent) -----
     if len(to_split) > 0:
         def _child_keys_of(parent_key):
             x, y, z = int(parent_key[0]), int(parent_key[1]), int(parent_key[2])
