@@ -18,14 +18,14 @@ class SharedBasisManager(torch.nn.Module):
         self.mode = mode  # 'global', 'shared', 'hybrid'
         self.n_basis = n_basis
         self.app_dim = app_dim
-        self.device = device
+        self.device = device if isinstance(device, torch.device) else torch.device(device)
         self.dtype = dtype
         self.sparsity_reg = sparsity_reg
         self.adaptive = adaptive
         
         if mode == 'global':
             # 全域共享基底（方案 A）
-            self.global_basis = torch.nn.Linear(n_basis, app_dim, bias=False)
+            self.global_basis = torch.nn.Linear(n_basis, app_dim, bias=False, device=self.device, dtype=self.dtype)
             torch.nn.init.orthogonal_(self.global_basis.weight)
             self.patch_coeffs = torch.nn.ModuleDict()
             
@@ -36,7 +36,7 @@ class SharedBasisManager(torch.nn.Module):
             
         elif mode == 'hybrid':
             # 混合模式：小 patches 用全域，大 patches 用獨立
-            self.global_basis = torch.nn.Linear(n_basis, app_dim, bias=False)
+            self.global_basis = torch.nn.Linear(n_basis, app_dim, bias=False, device=self.device, dtype=self.dtype)
             torch.nn.init.orthogonal_(self.global_basis.weight)
             self.patch_coeffs = torch.nn.ModuleDict()
             self._basis_bank = torch.nn.ModuleDict()
@@ -202,12 +202,13 @@ class GlobalBasisWrapper(torch.nn.Module):
         # 獲取或創建係數層
         key_str = f"{patch_key[0]}_{patch_key[1]}_{patch_key[2]}"
         if key_str not in manager.patch_coeffs:
-            coeffs = torch.nn.Linear(in_dim, manager.n_basis, bias=False)
+            coeffs = torch.nn.Linear(in_dim, manager.n_basis, bias=False, device=manager.device, dtype=manager.dtype )
             torch.nn.init.xavier_uniform_(coeffs.weight, gain=0.1)
             manager.patch_coeffs[key_str] = coeffs
         self.coeffs = manager.patch_coeffs[key_str]
     
     def forward(self, x):
+        x = x.to(self.manager.device)
         # VM features → coefficients → global basis
         coeff = self.coeffs(x)  # [N, n_basis]
         return self.manager.global_basis(coeff)  # [N, app_dim]
@@ -215,7 +216,7 @@ class GlobalBasisWrapper(torch.nn.Module):
     @property
     def weight(self):
         # 為了相容性，返回組合後的有效權重
-        # W_effective = W_coeffs @ W_basis
+        # W_effective = W_basis @ W_coeffs^T
         return self.manager.global_basis.weight @ self.coeffs.weight
 
 class _SeamLR2D(torch.nn.Module):
@@ -244,9 +245,9 @@ class _SeamLR1D(torch.nn.Module):
 
 class TensorVMSplitPatch(TensorBase):
     def __init__(self, aabb, gridSize, device, patch_grid_reso=8, **kargs):
-        self.use_shared_basis     = bool(kargs.pop("use_shared_basis", True))
         basis_mode                = kargs.pop("basis_mode", "global")  # 'global', 'shared', 'hybrid'
         self.n_basis              = int(kargs.pop("n_basis", 128))
+        self.use_shared_basis     = bool(kargs.pop("use_shared_basis", True))
         self.global_basis_enable  = bool(kargs.pop("global_basis_enable", False))
         self.global_basis_k_sigma = int(kargs.pop("global_basis_k_sigma", 64))
         self.global_basis_k_app   = int(kargs.pop("global_basis_k_app", 96))
@@ -2690,7 +2691,7 @@ class TensorVMSplitPatch(TensorBase):
         """獲取 basis（需要 patch_key 來識別）"""
         if not hasattr(self, 'shared_basis_manager'):
             # Fallback：創建獨立的 Linear
-            return torch.nn.Linear(in_dim, self.app_dim, bias=False)
+            return torch.nn.Linear(in_dim, self.app_dim, bias=False, device=self.aabb.device, dtype=self.basis_dtype)
         
         patch_info = {'res': self.patch_map[patch_key].get('res', [32,32,32])} if patch_key in self.patch_map else None
         return self.shared_basis_manager.get_or_create_basis(patch_key, in_dim, patch_info)
