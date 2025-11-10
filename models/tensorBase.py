@@ -338,6 +338,10 @@ class TensorBase(torch.nn.Module):
         aabb_min, aabb_max = self.aabb[0], self.aabb[1]
         near, far = self.near_far
         N_rays = rays_o.shape[0]
+
+        base_samples = self.default_nSamples if N_samples <= 0 else N_samples
+
+
         S = self.default_nSamples if N_samples <= 0 else N_samples
 
         if N_rays == 0:
@@ -370,6 +374,44 @@ class TensorBase(torch.nn.Module):
         # --- use ENTRY points to decide per-ray patch step size ---
         entry_pts = rays_o + t_enter.unsqueeze(-1) * rays_d  # [N_rays,3]
         ray_patch_coord, exists = self._map_coords_to_patch(entry_pts)  # coords: [N_rays,3], exists: [N_rays]
+
+        samples_list = []
+        z_vals_list = []
+
+        for i, (coord, hit) in enumerate(zip(ray_patch_coord, hits)):
+            if not hit:
+                # Ray 未擊中：使用基礎採樣
+                S = base_samples
+            else:
+                # 獲取 patch 重要性
+                key = tuple(coord.tolist())
+                patch = self.patch_map.get(key, None)
+                if patch is not None:
+                    importance = patch.get('alpha_mass', 0.5)
+                    complexity = getattr(patch, '_complexity_cache', 0.5)
+                    
+                    # 自適應採樣密度
+                    if importance > 0.7 or complexity > 0.7:
+                        S = int(base_samples * 1.5)  # 重要區域 1.5x 採樣
+                    elif importance < 0.3 and complexity < 0.3:
+                        S = int(base_samples * 0.7)  # 不重要區域 0.7x 採樣
+                    else:
+                        S = base_samples
+                else:
+                    S = base_samples
+            
+            # 生成採樣點
+            if S > 0:
+                step_size = patch_sizes[i] if i < len(patch_sizes) else self.stepSize
+                rng = torch.arange(S, device=device, dtype=dtype)
+                if is_train:
+                    rng = rng + torch.rand(1, device=device, dtype=dtype)
+                
+                z = t_enter[i] + rng * step_size
+                z = torch.minimum(z, torch.full_like(z, t_exit[i]))
+                z_vals_list.append(z)
+            else:
+                z_vals_list.append(torch.zeros(0, device=device, dtype=dtype))
 
         if should_print:
             miss_ratio = 1.0 - exists.float().mean().item()

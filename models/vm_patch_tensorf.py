@@ -139,21 +139,19 @@ class TensorVMSplitPatch(TensorBase):
         self.patch_grid_reso = patch_grid_reso  # totally (patch_grid_reso)^3 patches
 
         self.basis_dtype = getattr(self, "basis_dtype", torch.float32)
-        if bool(kargs.get("global_basis_enable", True)):
-            n_basis_sigma = int(kargs.get("global_basis_k_sigma", 64))
+        self.use_shared_basis = bool(kargs.get("use_shared_basis", True))
+        if self.use_shared_basis:
             n_basis_app = int(kargs.get("global_basis_k_app", 96))
-            
             self.shared_basis_manager = SharedBasisManager(
                 n_basis=n_basis_app,
                 app_dim=self.app_dim,
                 device=device,
-                dtype=self.basis_dtype
+                dtype=torch.float32
             )
-            self.use_shared_basis = True
+            print(f"[INFO] Using SharedBasisManager with {n_basis_app} basis vectors")
         else:
             self._basis_bank = torch.nn.ModuleDict()
             self._basis_registry = {}
-            self.use_shared_basis = False
 
         gate_dtype = self.aabb.dtype if hasattr(self, "aabb") else torch.get_default_dtype()
         self.register_buffer("alpha_gate_scale", torch.ones((), dtype=gate_dtype))
@@ -1198,12 +1196,26 @@ class TensorVMSplitPatch(TensorBase):
         patch_key = patch.get("_key", (0, 0, 0))
 
         if self.use_shared_basis and hasattr(self, 'shared_basis_manager'):
-            out = self.shared_basis_manager(patch_key, feat)  # [N, app_dim]
+            # 獲取 patch key
+            patch_key = patch.get("_key", None)
+            if patch_key is None:
+                # 嘗試從 patch 反推 key
+                for k, v in self.patch_map.items():
+                    if v is patch:
+                        patch_key = k
+                        break
+                if patch_key is None:
+                    patch_key = (0, 0, 0)  # fallback
+            
+            out = self.shared_basis_manager(patch_key, feat)
         elif 'mix_W' in patch and 'basis_B' in patch:
-            mid = torch.matmul(feat, patch['mix_W'].T)  # [N, r]
-            out = patch['basis_B'](mid)  # [N, app_dim]
+            # 低秩分解路徑
+            mid = torch.matmul(feat, patch['mix_W'].T)
+            out = patch['basis_B'](mid)
         else:
-            out = patch['basis_mat'](feat)  # [N, app_dim]
+            # 確保 basis_mat 存在
+            self._ensure_basis_for_feat(patch, feat.shape[1])
+            out = patch['basis_mat'](feat)
 
         out = self._blend_with_neighbors_if_needed(patch, xyz, out, kind="app")
         return out
@@ -1279,6 +1291,67 @@ class TensorVMSplitPatch(TensorBase):
             out[mask] = feat_sub
 
         return out
+    
+    def get_progressive_resolution(self, iteration, patch_importance=0.5):
+        """
+        漸進式解析度策略
+        根據訓練進度和 patch 重要性動態調整解析度
+        """
+        total_iters = getattr(self, 'total_iters', 30000)
+        progress = min(1.0, iteration / total_iters)
+        
+        # 基礎解析度調度
+        if progress < 0.1:
+            base_res = [8, 8, 8]
+        elif progress < 0.3:
+            base_res = [16, 16, 16]
+        elif progress < 0.6:
+            base_res = [32, 32, 32]
+        else:
+            base_res = [48, 48, 48]
+        
+        # 根據重要性調整
+        if patch_importance > 0.8:  # 重要 patch
+            adjusted = [min(64, int(r * 1.5)) for r in base_res]
+        elif patch_importance < 0.3:  # 不重要 patch
+            adjusted = [max(8, int(r * 0.7)) for r in base_res]
+        else:
+            adjusted = base_res
+        
+        # 確保是 8 的倍數（對 GPU 友好）
+        return tuple((r // 8) * 8 + (8 if r % 8 >= 4 else 0) for r in adjusted)
+    
+    def compute_patch_complexity(self, patch):
+        """
+        計算 patch 內容複雜度
+        用於智能 split 決策和解析度調整
+        """
+        complexity_score = 0.0
+        
+        with torch.no_grad():
+            for i in range(3):
+                # Density 複雜度
+                d_plane = patch['density_plane'][i]
+                if d_plane.numel() > 0:
+                    # 計算梯度幅度
+                    grad_y = torch.abs(d_plane[..., 1:, :] - d_plane[..., :-1, :]).mean()
+                    grad_x = torch.abs(d_plane[..., :, 1:] - d_plane[..., :, :-1]).mean()
+                    complexity_score += (grad_y + grad_x).item()
+                    
+                    # 計算標準差
+                    complexity_score += torch.std(d_plane).item()
+                
+                # App 複雜度
+                a_plane = patch['app_plane'][i]
+                if a_plane.numel() > 0:
+                    grad_y = torch.abs(a_plane[..., 1:, :] - a_plane[..., :-1, :]).mean()
+                    grad_x = torch.abs(a_plane[..., :, 1:] - a_plane[..., :, :-1]).mean()
+                    complexity_score += (grad_y + grad_x).item() * 0.5  # app 權重較低
+                    
+                    complexity_score += torch.std(a_plane).item() * 0.5
+        
+        # 正規化到 [0, 1]
+        return min(1.0, complexity_score / 6.0)
     
     def compute_patch_importance(self, patch, iteration):
         """
