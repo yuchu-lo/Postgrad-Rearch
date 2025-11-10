@@ -608,30 +608,30 @@ class TensorVMSplitPatch(TensorBase):
             K_app   = self.global_basis_k_app
             
             # Create coefficient matrices (much smaller than full tensors!)
-            density_coef_plane = torch.nn.ParameterList([
+            density_plane = torch.nn.ParameterList([
                 torch.nn.Parameter(0.01 * torch.randn(self.density_n_comp[i], K_sigma, device=device))
                 for i in range(3)
             ])
-            density_coef_line = torch.nn.ParameterList([
+            density_line = torch.nn.ParameterList([
                 torch.nn.Parameter(0.01 * torch.randn(self.density_n_comp[i], K_sigma, device=device))
                 for i in range(3)
             ])
             
-            app_coef_plane = torch.nn.ParameterList([
+            app_plane = torch.nn.ParameterList([
                 torch.nn.Parameter(0.01 * torch.randn(self.app_n_comp[i], K_app, device=device))
                 for i in range(3)
             ])
-            app_coef_line = torch.nn.ParameterList([
+            app_line = torch.nn.ParameterList([
                 torch.nn.Parameter(0.01 * torch.randn(self.app_n_comp[i], K_app, device=device))
                 for i in range(3)
             ])
             
             patch = {
                 'res': gridSize.copy(),
-                'density_coef_plane': density_coef_plane,
-                'density_coef_line':  density_coef_line,
-                'app_coef_plane':     app_coef_plane,
-                'app_coef_line':      app_coef_line,
+                'density_plane': density_plane,
+                'density_line':  density_line,
+                'app_plane':     app_plane,
+                'app_line':      app_line,
             }
         
         # Appearance basis (unchanged)
@@ -660,19 +660,19 @@ class TensorVMSplitPatch(TensorBase):
                 patch['app_line_res']      = _zeros_like_pl(patch['app_line'])
             else:
                 # Residuals also use coefficients
-                patch['density_coef_plane_res'] = torch.nn.ParameterList([
+                patch['density_plane_res'] = torch.nn.ParameterList([
                     torch.nn.Parameter(torch.zeros(self.density_n_comp[i], K_sigma, device=device))
                     for i in range(3)
                 ])
-                patch['density_coef_line_res'] = torch.nn.ParameterList([
+                patch['density_line_res'] = torch.nn.ParameterList([
                     torch.nn.Parameter(torch.zeros(self.density_n_comp[i], K_sigma, device=device))
                     for i in range(3)
                 ])
-                patch['app_coef_plane_res'] = torch.nn.ParameterList([
+                patch['app_plane_res'] = torch.nn.ParameterList([
                     torch.nn.Parameter(torch.zeros(self.app_n_comp[i], K_app, device=device))
                     for i in range(3)
                 ])
-                patch['app_coef_line_res'] = torch.nn.ParameterList([
+                patch['app_line_res'] = torch.nn.ParameterList([
                     torch.nn.Parameter(torch.zeros(self.app_n_comp[i], K_app, device=device))
                     for i in range(3)
                 ])
@@ -687,11 +687,11 @@ class TensorVMSplitPatch(TensorBase):
         if 'app_plane' in patch:
             return int(sum(p.shape[1] for p in patch['app_plane']) + 
                       sum(l.shape[1] for l in patch['app_line']))
-        elif 'app_coef_plane' in patch:
-            return int(sum(c.shape[0] for c in patch['app_coef_plane']) + 
-                      sum(c.shape[0] for c in patch['app_coef_line']))
+        elif 'app_plane' in patch:
+            return int(sum(c.shape[0] for c in patch['app_plane']) + 
+                      sum(c.shape[0] for c in patch['app_line']))
         else:
-            raise KeyError("Patch has neither app_plane nor app_coef_plane")
+            raise KeyError("Patch has neither app_plane nor app_plane")
     
     def _get_or_create_global_basis(self, res, basis_type, axis):
         """
@@ -1057,14 +1057,14 @@ class TensorVMSplitPatch(TensorBase):
         res = tuple(patch['res'])
         
         # Check if using shared basis (new) or full tensors (old)
-        use_shared_basis = ('density_coef_plane' in patch) and self.global_basis_enable
+        use_shared_basis = ('density_plane' in patch) and self.global_basis_enable
         
         for i in range(3):
             if use_shared_basis:
                 # NEW PATH: Reconstruct from coefficients + global basis
                 global_plane, global_line = self._get_or_create_global_basis(res, "density", i)
-                coef_p = patch['density_coef_plane'][i]  # [rank, K]
-                coef_l = patch['density_coef_line'][i]   # [rank, K]
+                coef_p = patch['density_plane'][i]  # [rank, K]
+                coef_l = patch['density_line'][i]   # [rank, K]
                 
                 plane_recon, line_recon = self._reconstruct_from_coef(
                     coef_p, coef_l, global_plane, global_line
@@ -1085,8 +1085,8 @@ class TensorVMSplitPatch(TensorBase):
         # Residual (only active in interior for boundary continuity)
         if bool(getattr(self, "enable_child_residual", True)):
             if use_shared_basis:
-                rpl = patch.get('density_coef_plane_res', None)
-                rln = patch.get('density_coef_line_res',  None)
+                rpl = patch.get('density_plane_res', None)
+                rln = patch.get('density_line_res',  None)
             else:
                 rpl = patch.get('density_plane_res', None)
                 rln = patch.get('density_line_res',  None)
@@ -1126,15 +1126,15 @@ class TensorVMSplitPatch(TensorBase):
         device = xyz.device
         res = tuple(patch['res'])
         
-        use_shared_basis = ('app_coef_plane' in patch) and self.global_basis_enable
+        use_shared_basis = ('app_plane' in patch) and self.global_basis_enable
         
         # Base features
         comps = []
         for i in range(3):
             if use_shared_basis:
                 global_plane, global_line = self._get_or_create_global_basis(res, "app", i)
-                coef_p = patch['app_coef_plane'][i]
-                coef_l = patch['app_coef_line'][i]
+                coef_p = patch['app_plane'][i]
+                coef_l = patch['app_line'][i]
                 
                 plane_recon, line_recon = self._reconstruct_from_coef(
                     coef_p, coef_l, global_plane, global_line
@@ -1156,8 +1156,8 @@ class TensorVMSplitPatch(TensorBase):
         # Interior-gated residuals
         if bool(getattr(self, "enable_child_residual", True)):
             if use_shared_basis:
-                rpl = patch.get('app_coef_plane_res', None)
-                rln = patch.get('app_coef_line_res',  None)
+                rpl = patch.get('app_plane_res', None)
+                rln = patch.get('app_line_res',  None)
             else:
                 rpl = patch.get('app_plane_res', None)
                 rln = patch.get('app_line_res',  None)
