@@ -134,7 +134,6 @@ class TensorVMSplitPatch(TensorBase):
         
         super().__init__(aabb, gridSize, device, **kargs)
         
-        self._basis_bank = torch.nn.ModuleDict()
         self._seam_banks = torch.nn.ModuleDict()
         self.basis_dtype = getattr(self, "basis_dtype", torch.float32)
         
@@ -574,7 +573,6 @@ class TensorVMSplitPatch(TensorBase):
 
         return patch
 
-
     def _init_one_svd(self, n_component, gridSize, scale, device):
         plane_coef, line_coef = [], []
         for i in range(len(self.vecMode)):
@@ -693,52 +691,6 @@ class TensorVMSplitPatch(TensorBase):
         else:
             raise KeyError("Patch has neither app_plane nor app_plane")
     
-    def _get_or_create_global_basis(self, res, basis_type, axis):
-        """
-        Lazy initialization of global shared basis for a given (res, type, axis).
-        
-        Args:
-            res: (Rx, Ry, Rz) tuple - resolution of this patch
-            basis_type: "density" or "app"
-            axis: 0, 1, 2 (corresponding to XY, YZ, XZ planes)
-        
-        Returns:
-            (plane_basis, line_basis): each a nn.Parameter
-        """
-        key = (tuple(res), basis_type, axis)
-        
-        if key in self._global_basis_cache:
-            return self._global_basis_cache[key]
-        
-        # Determine spatial dimensions for this axis
-        mat_id_0, mat_id_1 = self.matMode[axis]
-        vec_id = self.vecMode[axis]
-        H, W = res[mat_id_1], res[mat_id_0]
-        L = res[vec_id]
-        
-        K = self.global_basis_k_sigma if basis_type == "density" else self.global_basis_k_app
-        device = self.aabb.device
-        
-        # Initialize with small random values
-        plane_basis = torch.nn.Parameter(
-            0.02 * torch.randn(1, K, H, W, device=device),
-            requires_grad=True
-        )
-        line_basis = torch.nn.Parameter(
-            0.02 * torch.randn(1, K, L, 1, device=device),
-            requires_grad=True
-        )
-        
-        # Register as model parameters (important for optimizer!)
-        param_name_plane = f"_gb_{basis_type}_ax{axis}_r{res[0]}x{res[1]}x{res[2]}_plane"
-        param_name_line  = f"_gb_{basis_type}_ax{axis}_r{res[0]}x{res[1]}x{res[2]}_line"
-        self.register_parameter(param_name_plane, plane_basis)
-        self.register_parameter(param_name_line, line_basis)
-        
-        self._global_basis_cache[key] = (plane_basis, line_basis)
-        
-        return plane_basis, line_basis
-    
     def _reconstruct_from_coef(self, coef_plane, coef_line, global_plane, global_line):
         """
         Reconstruct full VM tensor from coefficients and global basis.
@@ -757,7 +709,6 @@ class TensorVMSplitPatch(TensorBase):
         line_recon  = torch.einsum('rk,bklw->brlw', coef_line,  global_line)   # [1, rank, L, 1]
         
         return plane_recon, line_recon
-
 
     def set_patch(self, patch_map=None, patch_key=None, d_plane=None, d_line=None, a_plane=None, a_line=None):
         """
