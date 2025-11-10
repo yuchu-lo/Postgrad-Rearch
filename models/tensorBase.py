@@ -665,7 +665,11 @@ class TensorBase(torch.nn.Module):
 
             dens_feat  = self.compute_density_patchwise_fast(pts_norm, patch_coords)
             sigma_vals = self.feature2density(dens_feat)
-            sigma_vals = torch.nan_to_num(sigma_vals, nan=0.0, posinf=1e6, neginf=0.0)
+            
+            # 改進的數值穩定性處理
+            sigma_vals = torch.clamp(sigma_vals, min=0.0, max=100.0)  # 使用合理的上限
+            sigma_vals = torch.nan_to_num(sigma_vals, nan=0.0, posinf=100.0, neginf=0.0)
+            
             sigma = sigma.masked_scatter(inside, sigma_vals)
 
         scale = float(getattr(self, "alpha_gate_scale", 1.0))
@@ -673,10 +677,16 @@ class TensorBase(torch.nn.Module):
 
         if inside.any():
             alpha = torch.zeros_like(sigma)
-            alpha[idxs] = 1.0 - torch.exp(-sigma[idxs] * lengths * global_len * float(self.distance_scale) * scale)
+            # 添加額外的數值穩定性檢查
+            exponent = sigma[idxs] * lengths * global_len * float(self.distance_scale) * scale
+            exponent = torch.clamp(exponent, max=10.0)  # 防止 exp 溢出
+            alpha[idxs] = 1.0 - torch.exp(-exponent)
         else:
-            alpha = 1.0 - torch.exp(-sigma * float(self.stepSize) * global_len * float(self.distance_scale) * scale)
+            exponent = sigma * float(self.stepSize) * global_len * float(self.distance_scale) * scale
+            exponent = torch.clamp(exponent, max=10.0)
+            alpha = 1.0 - torch.exp(-exponent)
 
+        alpha = torch.clamp(alpha, min=0.0, max=1.0)  # 確保在有效範圍內
         alpha = torch.nan_to_num(alpha, nan=0.0, posinf=1.0, neginf=0.0)
         return alpha
 
