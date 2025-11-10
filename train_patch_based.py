@@ -784,8 +784,7 @@ def reconstruction(args):
         with open(os.path.join(logfolder, "mem_breakdown.jsonl"), "a") as f:
             f.write(json.dumps(rec)+"\n")
 
-    def field_kd_loss(tensorf, step, device, *,
-                      max_pts=4096, sigma_w=1.0, app_w=1.0):
+    def field_kd_loss(tensorf, step, device, *, max_pts=4096, sigma_w=1.0, app_w=1.0, max_buffers=10): 
         """
         Compute light-weight field knowledge distillation (KD) loss on post-split children.
         Pulls (xyz, sigma_tgt, app_tgt) from tensorf._kd_buffers (CPU), evaluates current model,
@@ -797,11 +796,16 @@ def reconstruction(args):
         if not hasattr(tensorf, "_kd_buffers") or not tensorf._kd_buffers:
             return None
 
-        # drop expired
+        # drop expired AND limit total buffers
         alive = []
         for rec in tensorf._kd_buffers:
             if int(step) <= int(rec.get("expires_at", -1)):
                 alive.append(rec)
+        
+        # Keep only the most recent buffers if exceeding limit
+        if len(alive) > max_buffers:
+            alive = sorted(alive, key=lambda x: x.get("expires_at", 0), reverse=True)[:max_buffers]
+        
         tensorf._kd_buffers = alive
         if not alive:
             return None
