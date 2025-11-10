@@ -1059,141 +1059,81 @@ class TensorVMSplitPatch(TensorBase):
     def compute_density_patch(self, patch, xyz_sampled):
         """
         Sample density features for one patch (before feature2density).
-        Now supports both old (full tensors) and new (coefficients + shared basis) formats.
+        - xyz_sampled: [N,3] local coords in [0,1]
+        Returns: 
+            sigma_feat: [N]
         """
         if patch.get('dead', False):
             return torch.zeros(xyz_sampled.shape[0], device=xyz_sampled.device)
 
-        coord_plane, coord_line = self._get_patch_coords(xyz_sampled)
+        # base VM 
+        coord_plane, coord_line = self._get_patch_coords(xyz_sampled)  # lists: [3,N,1,2] / [3,N,1,1]
         N = xyz_sampled.shape[0]
         device = xyz_sampled.device
-        
-        sigma_acc = torch.zeros(N, device=device)
-        res = tuple(patch['res'])
-        
-        # Check if using shared basis (new) or full tensors (old)
-        use_shared_basis = ('density_plane' in patch) and self.global_basis_enable
-        
-        for i in range(3):
-            if use_shared_basis:
-                # NEW PATH: Reconstruct from coefficients + global basis
-                global_plane, global_line = self._get_or_create_global_basis(res, "density", i)
-                coef_p = patch['density_plane'][i]  # [rank, K]
-                coef_l = patch['density_line'][i]   # [rank, K]
-                
-                plane_recon, line_recon = self._reconstruct_from_coef(
-                    coef_p, coef_l, global_plane, global_line
-                )
-                
-                pfeat = self._gs2d_1CHW(plane_recon, coord_plane[i])  # [N, rank]
-                lfeat = self._gs1d_1CL1(line_recon,  coord_line[i])   # [N, rank]
-            else:
-                # OLD PATH: Direct sampling from full tensors
-                plane = self._plane_param_for(patch, 'density', i)
-                line  = self._line_param_for(patch, 'density', i)
-                
-                pfeat = self._gs2d_1CHW(plane, coord_plane[i])
-                lfeat = self._gs1d_1CL1(line,  coord_line[i])
-            
-            sigma_acc += (pfeat * lfeat).sum(dim=1)
 
-        # Residual (only active in interior for boundary continuity)
+        sigma_acc = torch.zeros(N, device=device)
+        
+        # 使用標準的 VM tensors（不需要 global basis 重建）
+        for i, (plane, line) in enumerate(zip(patch['density_plane'], patch['density_line'])):
+            pfeat = self._gs2d_1CHW(plane, coord_plane[i])  # (N, C)
+            lfeat = self._gs1d_1CL1(line,  coord_line[i])   # (N, C)
+            sigma_acc += (pfeat * lfeat).sum(dim=1)         # -> (N,)
+
+        # residual (only active in the interior -> boundary continuity)
         if bool(getattr(self, "enable_child_residual", True)):
             rpl = patch.get('density_plane_res', None)
             rln = patch.get('density_line_res',  None)
-            
             if (rpl is not None) and (rln is not None):
                 g = self._interior_gate(xyz_sampled).squeeze(-1)  # [N]
                 r_acc = torch.zeros_like(sigma_acc)
-                
-                for i in range(3):
-                    if use_shared_basis:
-                        global_plane, global_line = self._get_or_create_global_basis(res, "density", i)
-                        rp_recon, rl_recon = self._reconstruct_from_coef(
-                            rpl[i], rln[i], global_plane, global_line
-                        )
-                        rp = self._gs2d_1CHW(rp_recon, coord_plane[i])
-                        rl = self._gs1d_1CL1(rl_recon, coord_line[i])
-                    else:
-                        rplane, rline = rpl[i], rln[i]
-                        rp = self._gs2d_1CHW(rplane, coord_plane[i])
-                        rl = self._gs1d_1CL1(rline,  coord_line[i])
-                    
-                    r_acc += (rp * rl).sum(dim=1)
-                
+                for i, (rplane, rline) in enumerate(zip(rpl, rln)):
+                    rp = self._gs2d_1CHW(rplane, coord_plane[i])  # (N, C)
+                    rl = self._gs1d_1CL1(rline,  coord_line[i])   # (N, C)
+                    r_acc += (rp * rl).sum(dim=1)                 # (N,)
                 sigma_acc = sigma_acc + g * r_acc
 
-        # Seam blending (inference-time smoothing)
+        # seam blending near patch faces (inference-time smoothing, no extra params/loss)
         sigma_acc = self._blend_with_neighbors_if_needed(patch, xyz_sampled, sigma_acc, kind="density")
         return sigma_acc
-    
+
     def compute_app_patch(self, patch, xyz):
         """
         Build appearance features and project via basis matrix.
-        Now supports both old and new formats.
+        - xyz: [N,3] local coords in [0,1]
+        Returns: 
+            app_feat: [N, app_dim]
         """
-        coord_plane, coord_line = self._get_patch_coords(xyz)
-        N = xyz.shape[0]
-        device = xyz.device
-        res = tuple(patch['res'])
-        
-        use_shared_basis = ('app_plane' in patch) and self.global_basis_enable
-        
-        # Base features
-        comps = []
-        for i in range(3):
-            if use_shared_basis:
-                global_plane, global_line = self._get_or_create_global_basis(res, "app", i)
-                coef_p = patch['app_plane'][i]
-                coef_l = patch['app_line'][i]
-                
-                plane_recon, line_recon = self._reconstruct_from_coef(
-                    coef_p, coef_l, global_plane, global_line
-                )
-                
-                fx = self._gs2d_1CHW(plane_recon, coord_plane[i])
-                gx = self._gs1d_1CL1(line_recon,  coord_line[i])
-            else:
-                px = self._plane_param_for(patch, 'app', i)
-                lx = self._line_param_for(patch, 'app', i)
-                
-                fx = self._gs2d_1CHW(px, coord_plane[i])
-                gx = self._gs1d_1CL1(lx, coord_line[i])
-            
-            comps.extend([fx, gx])
-        
-        feat = torch.cat(comps, dim=1)  # [N, C_total]
+        # unpack per-axis tensors
+        px = self._plane_param_for(patch, 'app', 0)
+        py = self._plane_param_for(patch, 'app', 1)
+        pz = self._plane_param_for(patch, 'app', 2)
+        lx = self._line_param_for(patch, 'app', 0)
+        ly = self._line_param_for(patch, 'app', 1)
+        lz = self._line_param_for(patch, 'app', 2)
 
-        # Interior-gated residuals
+        # base features: grid-sample each mode with the right coordinate pairing
+        fx = self._gs2d_1CHW(px, xyz[:, [1, 2]])  # (N, Cx)
+        fy = self._gs2d_1CHW(py, xyz[:, [0, 2]])  # (N, Cy)
+        fz = self._gs2d_1CHW(pz, xyz[:, [0, 1]])  # (N, Cz)
+
+        gx = self._gs1d_1CL1(lx, xyz[:, [0]])     # (N, Cx)
+        gy = self._gs1d_1CL1(ly, xyz[:, [1]])     # (N, Cy)
+        gz = self._gs1d_1CL1(lz, xyz[:, [2]])     # (N, Cz)
+
+        feat = torch.cat([fx, fy, fz, gx, gy, gz], dim=1)  # (N, C_total)
+
+        # interior-gated residuals
         if bool(getattr(self, "enable_child_residual", True)):
-            if use_shared_basis:
-                rpl = patch.get('app_plane_res', None)
-                rln = patch.get('app_line_res',  None)
-            else:
-                rpl = patch.get('app_plane_res', None)
-                rln = patch.get('app_line_res',  None)
-            
+            rpl = patch.get('app_plane_res', None)
+            rln = patch.get('app_line_res',  None)
             if (rpl is not None) and (rln is not None):
-                rfeat_comps = []
-                for i in range(3):
-                    if use_shared_basis:
-                        global_plane, global_line = self._get_or_create_global_basis(res, "app", i)
-                        rp_recon, rl_recon = self._reconstruct_from_coef(
-                            rpl[i], rln[i], global_plane, global_line
-                        )
-                        rp = self._gs2d_1CHW(rp_recon, coord_plane[i])
-                        rl = self._gs1d_1CL1(rl_recon, coord_line[i])
-                    else:
-                        rp = self._gs2d_1CHW(rpl[i], coord_plane[i])
-                        rl = self._gs1d_1CL1(rln[i], coord_line[i])
-                    
-                    rfeat_comps.extend([rp, rl])
-                
-                rfeat = torch.cat(rfeat_comps, dim=1)
+                rfeat = self._app_feat_raw(patch, xyz)
                 g = self._interior_gate(xyz)  # [N,1]
                 feat = feat + g * rfeat
 
-        if self.use_shared_basis and hasattr(self, 'shared_basis_manager'):
+        # 使用 SharedBasisManager 或傳統 basis_mat
+        if hasattr(self, 'shared_basis_manager') and self.shared_basis_manager.mode == 'global':
+            # 需要 patch_key
             patch_key = patch.get("_key", None)
             if patch_key is None:
                 # 嘗試從 patch_map 反推 key
@@ -1203,15 +1143,20 @@ class TensorVMSplitPatch(TensorBase):
                         break
                 if patch_key is None:
                     patch_key = (0, 0, 0)  # fallback
-            out = self.shared_basis_manager(patch_key, feat)
-        else:
-            # Fallback: 每個 patch 有自己的投影矩陣
+            
+            # 使用 GlobalBasisWrapper（它實現了 forward 方法）
             if 'basis_mat' not in patch:
-                in_dim = feat.shape[1]
-                patch['basis_mat'] = torch.nn.Linear(in_dim, self.app_dim, bias=False, device=feat.device)
-                torch.nn.init.xavier_uniform_(patch['basis_mat'].weight)
-            out = patch['basis_mat'](feat)
+                # 第一次使用，創建 wrapper
+                patch['basis_mat'] = self.shared_basis_manager.get_or_create_basis(
+                    patch_key, feat.shape[1], {'res': patch.get('res', [32,32,32])}
+                )
+            out = patch['basis_mat'](feat)  # GlobalBasisWrapper.forward
+        else:
+            # 傳統路徑：每個 patch 有自己的 basis_mat
+            self._ensure_basis_for_feat(patch, feat.shape[1])
+            out = patch['basis_mat'](feat)  # (N, app_dim)
 
+        # seam blending near patch faces
         out = self._blend_with_neighbors_if_needed(patch, xyz, out, kind="app")
         return out
 
