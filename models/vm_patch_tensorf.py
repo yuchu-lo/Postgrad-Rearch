@@ -57,6 +57,55 @@ class SharedBasisManager(torch.nn.Module):
             else:
                 return self._get_shared_basis(in_dim, self.app_dim)
     
+    def _get_shared_basis(self, in_dim, out_dim):
+        """內部方法：獲取或創建共享的 basis（用於 shared 和 hybrid 模式）"""
+        key = (int(in_dim), int(out_dim), str(self.device), str(self.dtype))
+        
+        if key not in self._basis_registry:
+            # 創建新的共享 basis
+            bank_id = f"basis_{in_dim}_{out_dim}_{len(self._basis_bank)}"
+            basis = torch.nn.Linear(in_dim, out_dim, bias=False, 
+                                   device=self.device, dtype=self.dtype)
+            self._basis_bank[bank_id] = basis
+            self._basis_registry[key] = bank_id
+        
+        bank_id = self._basis_registry[key]
+        return self._basis_bank[bank_id]
+    
+    def cleanup_unused(self, active_keys):
+        """
+        清理未使用的係數矩陣
+        Args:
+            active_keys: 當前活躍的 patch keys 列表
+        Returns:
+            清理的係數矩陣數量
+        """
+        if self.mode == 'global' or self.mode == 'hybrid':
+            if not hasattr(self, 'patch_coeffs'):
+                return 0
+            
+            # 轉換 active_keys 為字符串格式
+            active_set = {f"{k[0]}_{k[1]}_{k[2]}" for k in active_keys}
+            
+            # 找出需要移除的 keys
+            to_remove = []
+            for key_str in list(self.patch_coeffs.keys()):
+                if key_str not in active_set:
+                    to_remove.append(key_str)
+            
+            # 移除未使用的係數矩陣
+            for key_str in to_remove:
+                del self.patch_coeffs[key_str]
+            
+            return len(to_remove)
+        
+        elif self.mode == 'shared':
+            # shared 模式下，可以清理未被任何 patch 引用的 basis
+            # 這需要更複雜的引用計數，暫時返回 0
+            return 0
+        
+        return 0
+    
     def compute_sparsity_loss(self):
         """計算係數稀疏性損失（用於正則化）"""
         if self.mode != 'global' or not self.patch_coeffs:
@@ -96,6 +145,50 @@ class SharedBasisManager(torch.nn.Module):
                 self.n_basis = new_n_basis
                 
                 return self.n_basis  # 返回剩餘的基底數
+        
+        return self.n_basis
+    
+    def get_memory_usage(self):
+        """計算當前記憶體使用量（MB）"""
+        total_params = 0
+        
+        if hasattr(self, 'global_basis'):
+            total_params += sum(p.numel() for p in self.global_basis.parameters())
+        
+        if hasattr(self, 'patch_coeffs'):
+            for coeffs in self.patch_coeffs.values():
+                total_params += sum(p.numel() for p in coeffs.parameters())
+        
+        if hasattr(self, '_basis_bank'):
+            for basis in self._basis_bank.values():
+                total_params += sum(p.numel() for p in basis.parameters())
+        
+        # 假設 float32（4 bytes per parameter）
+        return (total_params * 4) / (1024 * 1024)
+    
+    def get_statistics(self):
+        """獲取統計資訊"""
+        stats = {
+            'mode': self.mode,
+            'n_basis': self.n_basis,
+            'memory_mb': self.get_memory_usage()
+        }
+        
+        if self.mode in ['global', 'hybrid']:
+            stats['n_patches'] = len(self.patch_coeffs)
+            
+            if self.patch_coeffs:
+                # 計算係數稀疏度
+                sparsity = []
+                for coeffs in self.patch_coeffs.values():
+                    sparse_ratio = (coeffs.weight.abs() < 1e-6).float().mean().item()
+                    sparsity.append(sparse_ratio)
+                stats['avg_sparsity'] = sum(sparsity) / len(sparsity)
+        
+        if self.mode in ['shared', 'hybrid']:
+            stats['n_shared_basis'] = len(self._basis_bank)
+        
+        return stats
     
 class GlobalBasisWrapper(torch.nn.Module):
     """包裝器，讓全域基底用起來像普通的 Linear layer"""
