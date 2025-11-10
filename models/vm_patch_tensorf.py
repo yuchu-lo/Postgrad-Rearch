@@ -35,7 +35,7 @@ class SharedBasisManager(torch.nn.Module):
         
         if key_str not in self.patch_coeffs:
             coeffs = torch.nn.Linear(in_dim, self.n_basis, bias=False, 
-                                    device=self.device, dtype=self.dtype)
+                                     device=self.device, dtype=self.dtype)
             torch.nn.init.xavier_uniform_(coeffs.weight, gain=0.1)
             self.patch_coeffs[key_str] = coeffs
             
@@ -136,9 +136,8 @@ class TensorVMSplitPatch(TensorBase):
         self._seam_banks = torch.nn.ModuleDict()
         self.basis_dtype = getattr(self, "basis_dtype", torch.float32)
         
-        if self.use_shared_basis:
-            self.shared_basis_manager = SharedBasisManager(n_basis=self.n_basis, app_dim=self.app_dim, device=device, dtype=self.basis_dtype)
-            print(f"[INFO] Using SharedBasisManager with {self.n_basis} basis vectors")
+        if not hasattr(self, 'shared_basis_manager'):
+            self.shared_basis_manager = SharedBasisManager(use_shared=getattr(self, 'use_shared_basis', True))
         
         gate_dtype = self.aabb.dtype  
         self.register_buffer("alpha_gate_scale", torch.ones((), dtype=gate_dtype))
@@ -558,7 +557,8 @@ class TensorVMSplitPatch(TensorBase):
         patch['app_plane']     = _to_paramlist(patch['app_plane'])
         patch['app_line']      = _to_paramlist(patch['app_line'])
 
-        if 'basis_mat' in patch and isinstance(patch['basis_mat'], torch.nn.Module):
+        if 'basis_mat' in patch:
+           in_dim = self._app_in_dim_from_vm(patch['app_plane'], patch['app_line'])
            patch['basis_mat'] = self.get_shared_basis(in_dim, self.app_dim)
 
         return patch
@@ -2581,11 +2581,10 @@ class TensorVMSplitPatch(TensorBase):
         return child
 
     def get_shared_basis(self, in_dim, out_dim):
-        """
-        兼容性存根 - 現在由 SharedBasisManager 處理
-        """
-        # 返回一個簡單的 Linear layer 作為 fallback
-        return torch.nn.Linear(in_dim, out_dim, bias=False, device=self.aabb.device)
+        if hasattr(self, 'shared_basis_manager'):
+            return self.shared_basis_manager.get_or_create_basis(in_dim, out_dim)
+        else:
+            return torch.nn.Linear(in_dim, out_dim, bias=False)
 
     def _app_in_dim_from_planes(self, app_plane_list):
         return int(sum(p.shape[1] for p in app_plane_list))
@@ -3653,11 +3652,26 @@ class TensorVMSplitPatch(TensorBase):
         _copy(new_patch["app_plane"],     P["app_plane"])
         _copy(new_patch["app_line"],      P["app_line"])
 
-        in_dim  = P["basis_w"].shape[1]
-        out_dim = int(P.get("app_dim", P["basis_w"].shape[0]))
-        new_lin = torch.nn.Linear(in_dim, out_dim, bias=has_b).to(device)
-        new_lin.weight.data.copy_(P["basis_w"].to(device))
-        new_patch["basis_mat"] = new_lin
+        # 修改這部分：不再直接創建 Linear，而是從 SharedBasisManager 獲取
+        if "basis_w" in P:  # 舊版相容性
+            in_dim  = P["basis_w"].shape[1]
+            out_dim = int(P.get("app_dim", P["basis_w"].shape[0]))
+        else:
+            in_dim = self._app_in_dim_from_vm(new_patch["app_plane"], new_patch["app_line"])
+            out_dim = self.app_dim
+        
+        # 從 SharedBasisManager 獲取
+        new_patch["basis_mat"] = self.get_shared_basis(in_dim, out_dim)
+        
+        # 如果有舊的權重，嘗試複製（但這可能會覆蓋共享的權重）
+        if "basis_w" in P:
+            with torch.no_grad():
+                W = P["basis_w"].to(device)
+                if tuple(W.shape) == tuple(new_patch["basis_mat"].weight.shape):
+                    new_patch["basis_mat"].weight.copy_(W)
+                else:
+                    print(f"[WARN] basis weight shape mismatch, skip copy")
+        
         new_patch["res"] = R
         return new_patch
 
@@ -3681,11 +3695,6 @@ class TensorVMSplitPatch(TensorBase):
             lin = patch['basis_mat']
             patch_state[f"{key}.basis_mat.in"]  = torch.tensor(lin.in_features, dtype=torch.int32)
             patch_state[f"{key}.basis_mat.out"] = torch.tensor(lin.out_features, dtype=torch.int32)
-            has_bias = (lin.bias is not None)
-            patch_state[f"{key}.basis_mat.has_bias"] = torch.tensor(1 if has_bias else 0, dtype=torch.uint8)
-            patch_state[f"{key}.basis_mat.weight"] = lin.weight.detach().cpu()
-            if has_bias:
-                patch_state[f"{key}.basis_mat.bias"] = lin.bias.detach().cpu()
 
         state['patch_map'] = patch_state
         state['patch_grid_reso'] = torch.tensor(list(self.patch_grid_reso), dtype=torch.int32)
@@ -3745,15 +3754,10 @@ class TensorVMSplitPatch(TensorBase):
             apl = _collect_paramlist(pid, "app_plane")
             aln = _collect_paramlist(pid, "app_line")
 
-            has_w   = (f"{pid}.basis_mat.weight" in patch_state)
-            has_b   = (f"{pid}.basis_mat.bias"   in patch_state)
-            has_in  = (f"{pid}.basis_mat.in"     in patch_state)
-            has_out = (f"{pid}.basis_mat.out"    in patch_state)
+            has_in  = (f"{pid}.basis_mat.in"  in patch_state)
+            has_out = (f"{pid}.basis_mat.out" in patch_state)
 
-            if has_w: 
-                W = patch_state[f"{pid}.basis_mat.weight"]
-                out_dim, in_dim = int(W.shape[-2]), int(W.shape[-1])
-            elif has_in and has_out:
+            if has_in and has_out:
                 in_dim  = int(patch_state[f"{pid}.basis_mat.in"])
                 out_dim = int(patch_state[f"{pid}.basis_mat.out"])
             else:
@@ -3762,21 +3766,9 @@ class TensorVMSplitPatch(TensorBase):
 
             bm = self.get_shared_basis(in_dim, out_dim)
 
-            with torch.no_grad():
-                if has_w:
-                    W = patch_state[f"{pid}.basis_mat.weight"].to(device)
-                    if tuple(W.shape) == tuple(bm.weight.shape):
-                        bm.weight.copy_(W)
-                    else:
-                        print(f"[load_state_dict][WARN] basis weight shape mismatch: "
-                            f"ckpt={tuple(W.shape)} vs cur={tuple(bm.weight.shape)}; skip copy.")
-                if has_b and (bm.bias is not None):
-                    B = patch_state[f"{pid}.basis_mat.bias"].to(device)
-                    if tuple(B.shape) == tuple(bm.bias.shape):
-                        bm.bias.copy_(B)
-                    else:
-                        print(f"[load_state_dict][WARN] basis bias shape mismatch: "
-                            f"ckpt={tuple(B.shape)} vs cur={tuple(bm.bias.shape)}; skip copy.")
+            if f"{pid}.basis_mat.weight" in patch_state:
+                print(f"[WARN] Found basis_mat.weight for patch {pid}, "
+                      f"but weights are now managed by SharedBasisManager. Skipping.")
 
             patch = {
                 "res": res,
