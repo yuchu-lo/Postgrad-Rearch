@@ -340,9 +340,7 @@ class TensorBase(torch.nn.Module):
         N_rays = rays_o.shape[0]
 
         base_samples = self.default_nSamples if N_samples <= 0 else N_samples
-
-
-        S = self.default_nSamples if N_samples <= 0 else N_samples
+        S = base_samples 
 
         if N_rays == 0:
             empty_pts = torch.empty((0, S, 3), device=device, dtype=dtype)
@@ -375,43 +373,65 @@ class TensorBase(torch.nn.Module):
         entry_pts = rays_o + t_enter.unsqueeze(-1) * rays_d  # [N_rays,3]
         ray_patch_coord, exists = self._map_coords_to_patch(entry_pts)  # coords: [N_rays,3], exists: [N_rays]
 
-        samples_list = []
-        z_vals_list = []
+        aabb_len = (aabb_max - aabb_min).to(dtype=dtype)
+        base_res = torch.as_tensor(self.gridSize, device=device, dtype=dtype)
+
+        step_list = []
+        samples_per_ray = []
 
         for i, (coord, hit) in enumerate(zip(ray_patch_coord, hits)):
-            if not hit:
-                # Ray 未擊中：使用基礎採樣
-                S = base_samples
-            else:
-                # 獲取 patch 重要性
+            if hit:
                 key = tuple(coord.tolist())
                 patch = self.patch_map.get(key, None)
                 if patch is not None:
+                    res = torch.as_tensor(patch['res'], device=device, dtype=dtype)
+                    
+                    # 獲取 patch 重要性來決定採樣密度
                     importance = patch.get('alpha_mass', 0.5)
                     complexity = getattr(patch, '_complexity_cache', 0.5)
                     
                     # 自適應採樣密度
                     if importance > 0.7 or complexity > 0.7:
-                        S = int(base_samples * 1.5)  # 重要區域 1.5x 採樣
+                        samples = int(base_samples * 1.5)  # 重要區域 1.5x 採樣
                     elif importance < 0.3 and complexity < 0.3:
-                        S = int(base_samples * 0.7)  # 不重要區域 0.7x 採樣
+                        samples = int(base_samples * 0.7)  # 不重要區域 0.7x 採樣
                     else:
-                        S = base_samples
+                        samples = base_samples
                 else:
-                    S = base_samples
-            
-            # 生成採樣點
-            if S > 0:
-                step_size = patch_sizes[i] if i < len(patch_sizes) else self.stepSize
-                rng = torch.arange(S, device=device, dtype=dtype)
-                if is_train:
-                    rng = rng + torch.rand(1, device=device, dtype=dtype)
-                
-                z = t_enter[i] + rng * step_size
-                z = torch.minimum(z, torch.full_like(z, t_exit[i]))
-                z_vals_list.append(z)
+                    res = base_res
+                    samples = base_samples
             else:
-                z_vals_list.append(torch.zeros(0, device=device, dtype=dtype))
+                res = base_res
+                samples = base_samples
+                
+            unit_size = aabb_len / res
+            step_list.append(unit_size.mean() * self.step_ratio)
+            samples_per_ray.append(samples)
+        
+        patch_sizes = torch.stack(step_list)  # [N_rays]
+
+        # === 建立採樣點 - 使用統一的採樣數（取最大值）===
+        max_samples = max(samples_per_ray) if samples_per_ray else base_samples
+        S = max_samples
+        
+        # 為所有光線生成採樣點
+        rng = torch.arange(S, device=device, dtype=dtype).unsqueeze(0).repeat(N_rays, 1)
+        if is_train:
+            rng = rng + torch.rand((N_rays, 1), device=device, dtype=dtype)
+
+        z_vals = t_enter.unsqueeze(1) + rng * patch_sizes.unsqueeze(1)   # [N_rays, S]
+        z_vals = torch.minimum(z_vals, t_exit.unsqueeze(1))              # stay within [enter, exit]
+
+        # 根據每條光線的實際採樣數進行 mask
+        sample_mask = torch.zeros((N_rays, S), device=device, dtype=torch.bool)
+        for i, num_samples in enumerate(samples_per_ray):
+            sample_mask[i, :num_samples] = True
+
+        rays_pts = rays_o.unsqueeze(1) + rays_d.unsqueeze(1) * z_vals.unsqueeze(2)  # [N_rays, S, 3]
+
+        # strictly inside AABB and along valid segment
+        in_box = ((rays_pts >= aabb_min) & (rays_pts <= aabb_max)).all(dim=-1)      # [N_rays, S]
+        mask_in = in_box & hits.unsqueeze(1) & sample_mask                          # [N_rays, S]
 
         if should_print:
             miss_ratio = 1.0 - exists.float().mean().item()
@@ -420,40 +440,6 @@ class TensorBase(torch.nn.Module):
             origin_in = ((rays_o >= aabb_min) & (rays_o <= aabb_max)).all(dim=-1).float().mean().item()
             hit_frac  = hits.float().mean().item()
             print(f"[dbg] step={gs} | N_rays={N_rays} | origin_inAABB={origin_in:.1%} | hits={hit_frac:.1%} | entries_in_map={(1.0 - miss_ratio):.1%}")
-
-        aabb_len = (aabb_max - aabb_min).to(dtype=dtype)
-        base_res = torch.as_tensor(self.gridSize, device=device, dtype=dtype)
-
-        step_list = []
-        for coord, hit in zip(ray_patch_coord, hits):
-            if hit:
-                key = tuple(coord.tolist())
-                patch = self.patch_map.get(key, None)
-                if patch is not None:
-                    res = torch.as_tensor(patch['res'], device=device, dtype=dtype)
-                else:
-                    res = base_res
-            else:
-                res = base_res
-            unit_size = aabb_len / res
-            step_list.append(unit_size.mean() * self.step_ratio)
-        patch_sizes = torch.stack(step_list)  # [N_rays]
-
-        # --- build samples ---
-        rng = torch.arange(S, device=device, dtype=dtype).unsqueeze(0).repeat(N_rays, 1)
-        if is_train:
-            rng = rng + torch.rand((N_rays, 1), device=device, dtype=dtype)
-
-        z_vals = t_enter.unsqueeze(1) + rng * patch_sizes.unsqueeze(1)   # [N_rays, S]
-        z_vals = torch.minimum(z_vals, t_exit.unsqueeze(1))              # stay within [enter, exit]
-
-        rays_pts = rays_o.unsqueeze(1) + rays_d.unsqueeze(1) * z_vals.unsqueeze(2)  # [N_rays, S, 3]
-
-        # strictly inside AABB and along valid segment (no forced True)
-        in_box = ((rays_pts >= aabb_min) & (rays_pts <= aabb_max)).all(dim=-1)      # [N_rays, S]
-        mask_in = in_box & hits.unsqueeze(1)                                        # [N_rays, S]
-
-        if should_print:
             print(f"[dbg] step={gs} | mean_step={patch_sizes.mean().item():.6f} | min_max_step=({patch_sizes.min().item():.6f},{patch_sizes.max().item():.6f})")
 
         return rays_pts, z_vals, mask_in
