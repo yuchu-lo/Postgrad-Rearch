@@ -19,8 +19,81 @@ import copy
 from copy import deepcopy
 from itertools import chain
 from types import SimpleNamespace
+import matplotlib.pyplot as plt
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+class ExperimentLogger:
+    def __init__(self, log_dir):
+        self.log_dir = log_dir
+        self.metrics = defaultdict(list)
+        
+    def log_iteration(self, iteration, psnr, memory_mb, n_patches, total_voxels):
+        """記錄每次迭代的關鍵指標"""
+        self.metrics['iteration'].append(iteration)
+        self.metrics['psnr'].append(psnr)
+        self.metrics['memory_mb'].append(memory_mb)
+        self.metrics['n_patches'].append(n_patches)
+        self.metrics['total_voxels'].append(total_voxels)
+        
+        # 計算效率指標
+        if memory_mb > 0:
+            self.metrics['psnr_per_mb'].append(psnr / memory_mb)
+        
+    def generate_plots(self):
+        """自動生成論文用圖表"""
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        
+        # PSNR vs Iteration
+        axes[0, 0].plot(self.metrics['iteration'], self.metrics['psnr'])
+        axes[0, 0].set_xlabel('Iteration')
+        axes[0, 0].set_ylabel('PSNR (dB)')
+        axes[0, 0].grid(True)
+        
+        # Memory vs Iteration
+        axes[0, 1].plot(self.metrics['iteration'], self.metrics['memory_mb'])
+        axes[0, 1].set_xlabel('Iteration')
+        axes[0, 1].set_ylabel('Memory (MB)')
+        axes[0, 1].grid(True)
+        
+        # PSNR vs Memory (最重要的圖)
+        axes[1, 0].scatter(self.metrics['memory_mb'], self.metrics['psnr'])
+        axes[1, 0].set_xlabel('Memory (MB)')
+        axes[1, 0].set_ylabel('PSNR (dB)')
+        axes[1, 0].grid(True)
+        
+        # Efficiency over time
+        axes[1, 1].plot(self.metrics['iteration'], self.metrics['psnr_per_mb'])
+        axes[1, 1].set_xlabel('Iteration')
+        axes[1, 1].set_ylabel('PSNR per MB')
+        axes[1, 1].grid(True)
+        
+        plt.tight_layout()
+        plt.savefig(f'{self.log_dir}/experiment_results.png', dpi=300)
+        
+    def generate_latex_table(self):
+        """生成 LaTeX 表格供論文使用"""
+        final_idx = -1
+        latex = f"""
+        \\begin{{table}}[h]
+        \\centering
+        \\begin{{tabular}}{{|l|c|c|c|}}
+        \\hline
+        Metric & Initial & Final & Improvement \\\\
+        \\hline
+        PSNR (dB) & {self.metrics['psnr'][0]:.2f} & {self.metrics['psnr'][final_idx]:.2f} & 
+            {self.metrics['psnr'][final_idx] - self.metrics['psnr'][0]:.2f} \\\\
+        Memory (MB) & {self.metrics['memory_mb'][0]:.1f} & {self.metrics['memory_mb'][final_idx]:.1f} & 
+            {(1 - self.metrics['memory_mb'][final_idx]/self.metrics['memory_mb'][0])*100:.1f}\\% \\\\
+        Patches & {self.metrics['n_patches'][0]} & {self.metrics['n_patches'][final_idx]} & 
+            {self.metrics['n_patches'][final_idx] - self.metrics['n_patches'][0]} \\\\
+        \\hline
+        \\end{{tabular}}
+        \\caption{{Performance comparison of our uneven patch method}}
+        \\end{{table}}
+        """
+        with open(f'{self.log_dir}/results_table.tex', 'w') as f:
+            f.write(latex)
 
 class SimpleSampler:
     def __init__(self, total, batch):
@@ -1026,6 +1099,7 @@ def reconstruction(args):
             promoted.append(key)
         return promoted
 
+    exp_logger = ExperimentLogger(logfolder)
 
     # TensoRF uses "divisor" for downsample; values < 1.0 upsample and will blow memory!
     if float(getattr(args, "downsample_train", 1.0)) < 1.0:
@@ -1630,6 +1704,15 @@ def reconstruction(args):
 
     pbar = tqdm(range(args.n_iters), miniters=args.progress_refresh_rate, file=sys.stdout) 
     for iteration in pbar:
+        if iteration % 100 == 0:  
+            exp_logger.log_iteration(
+                iteration=iteration,
+                psnr=PSNR,
+                memory_mb=tensorf.get_total_mem() / (1024**2),
+                n_patches=len(tensorf.patch_map),
+                total_voxels=tensorf.get_total_voxels()
+            )
+
         # pre-step warm-up: apply updated lr
         if maybe_warmup_hook is not None:
             maybe_warmup_hook(iteration) 
@@ -1643,7 +1726,23 @@ def reconstruction(args):
                 t = max(0.0, min(1.0, (iteration - start) / max(1, end - start)))
                 gate = 0.2 + 0.8 * t
                 tensorf.renderModule.set_fea_gate(gate)
-       
+
+        # periodical cleanup
+        if iteration % 1000 == 0:
+            if hasattr(tensorf, 'cleanup_seam_banks'):
+                removed = tensorf.cleanup_seam_banks(keep_active_only=True)
+                if removed > 0:
+                    print(f"[Cleanup] Removed {removed} unused seam banks")
+            
+            if hasattr(tensorf, 'shared_basis_manager'):
+                active_keys = list(tensorf.patch_map.keys())
+                removed = tensorf.shared_basis_manager.cleanup_unused(active_keys)
+                if removed > 0:
+                    print(f"[Cleanup] Removed {removed} unused basis coefficients")
+
+            if hasattr(tensorf, '_kd_buffers') and len(tensorf._kd_buffers) > 10:
+                tensorf._kd_buffers = tensorf._kd_buffers[-10:]  # last 10 new 
+
         tensorf.global_step = iteration
 
         def _coalesce_base_floors(args, model):
@@ -3512,6 +3611,11 @@ def reconstruction(args):
     tensorf.save(final_ckpt, extra_meta={'iter': iteration, 'args': vars(args)})
     print('has patch_map:', 'patch_map' in tensorf.state_dict())
     print("Training completed and final checkpoint is saved.")
+
+    if iteration == args.n_iters - 1:
+        exp_logger.generate_plots()
+        exp_logger.generate_latex_table()
+        print(f"[INFO] Experiment results saved to {logfolder}")
 
     if args.render_train or args.render_test or args.render_path:
         args.ckpt = final_ckpt

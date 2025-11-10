@@ -233,6 +233,7 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
         p = tensorf.patch_map[key]
         dp, dl  = p["density_plane"], p["density_line"]
         ap, al  = p["app_plane"],     p["app_line"]
+        complexity = tensorf.compute_patch_complexity(p)
 
         _uk = (key, _res_key)
         if _uk in _up_cache:
@@ -365,13 +366,17 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
         delta_mem_MB = max(1e-6, float(mem_f - mem_c) / (1024.0**2))
         avg_gain  = float(sum(gains) / used_views) if len(gains) == used_views else 0.0
         gain_per_mem = avg_gain / delta_mem_MB
+
         split_cost = _boundary_cost_proxy_for_split(p, rough_avg)
-        
+        complexity_factor = 1.0 - complexity * 0.5  # 複雜區域 cost 降低最多 50%
+        split_cost = split_cost * complexity_factor
+
         candidates.append({
             "key": key,
             "avg_margin": avg_margin,
             "roughness": rough_avg,
             "split_cost": split_cost,
+            "complexity": complexity,
             "avg_gain": avg_gain,
             "delta_mem_MB": delta_mem_MB,
             "gain_per_mem": gain_per_mem,
@@ -412,7 +417,13 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
     else:  
         cand_vm_sorted = sorted(candidates, key=lambda d: d["avg_margin"])
 
-    cand_split_sorted = sorted(candidates, key=lambda d: (d["avg_margin"] + d["split_cost"]))
+    def split_score(d):
+        base_score = d["avg_margin"] + d["split_cost"]
+        # 複雜區域加分（優先 split）
+        complexity_bonus = -d["complexity"] * 0.3
+        return base_score + complexity_bonus
+    
+    cand_split_sorted = sorted(candidates, key=split_score)
 
     to_promote, to_split = [], []
 
