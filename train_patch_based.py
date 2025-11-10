@@ -1173,6 +1173,9 @@ def reconstruction(args):
             rank_cap_app=args.rank_cap_app,
             rank_base_floor_sig=args.rank_base_floor_sig,
             rank_base_floor_app=args.rank_base_floor_app,
+            global_basis_enable=bool(args.global_basis_enable),
+            global_basis_k_sigma=args.global_basis_k_sigma,
+            global_basis_k_app=args.global_basis_k_app,
             min_rank=args.min_rank,
             max_rank=args.max_rank,
             repair_enable=args.repair_enable,
@@ -1185,6 +1188,10 @@ def reconstruction(args):
             seam_rank_sigma=args.seam_rank_sigma,
             seam_rank_app=args.seam_rank_app,
         )
+        
+        if hasattr(tensorf, 'enable_seam_blend'):
+            tensorf.enable_seam_blend = False
+            print("[INFO] Seam blending DISABLED during training (will enable for eval)")
 
         # set residual/seam controls as attributes on the model (not part of TensorBase.__init__ signature)
         try:

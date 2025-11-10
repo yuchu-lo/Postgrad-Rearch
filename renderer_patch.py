@@ -100,6 +100,10 @@ def evaluation(test_dataset, tensorf, args, renderer, savePath=None, N_vis=5, pr
     Patch-compatible evaluation function for testing UVG (uneven voxel grid) rendering.
     Supports PSNR/SSIM/LPIPS metric computation and optional video export.
     """
+    seam_was_enabled = getattr(tensorf, 'enable_seam_blend', True)
+    if hasattr(tensorf, 'enable_seam_blend'):
+        tensorf.enable_seam_blend = True
+    
     PSNRs, rgb_maps, depth_maps = [], [], []
     ssims, l_alex, l_vgg = [], [], []
 
@@ -168,7 +172,10 @@ def evaluation(test_dataset, tensorf, args, renderer, savePath=None, N_vis=5, pr
             np.savetxt(f'{savePath}/{prtx}mean.txt', np.asarray([avg_psnr, avg_ssim, avg_alex, avg_vgg]))
         else:
             np.savetxt(f'{savePath}/{prtx}mean.txt', np.asarray([avg_psnr]))
-
+        
+    if hasattr(tensorf, 'enable_seam_blend'):
+        tensorf.enable_seam_blend = seam_was_enabled
+    
     return PSNRs
 
 @torch.no_grad()

@@ -57,9 +57,9 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
     bcost_smooth_strength = float(getattr(args, "boundary_smooth_strength", 1.0))  # scale on (1 - roughness)
     # ------------------------------------------------------------------------
 
-    if   step < 5_000:  n_view = 5
-    elif step < 10_000: n_view = 10
-    else:               n_view = 20
+    if   step < 5_000:  n_view = 3
+    elif step < 10_000: n_view = 5
+    else:               n_view = 8
 
     views  = min(n_view, len(test_dataset.all_rgbs))
     stride = max(len(test_dataset.all_rgbs) // max(views, 1), 1)

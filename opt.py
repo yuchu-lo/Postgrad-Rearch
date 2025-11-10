@@ -71,6 +71,14 @@ def config_parser(cmd=None):
                         help='shift for density before activation')
     parser.add_argument('--rm_weight_mask_thre', type=float, default=0.0,
                         help='remove ray mask threshold (<=0 to disable)')
+    
+    # —— Shared basis —— 
+    parser.add_argument('--global_basis_enable', type=int, default=1,
+                    help='Enable global shared basis for VM decomposition (1=enabled, 0=use old method)')
+    parser.add_argument('--global_basis_k_sigma', type=int, default=64,
+                        help='Number of global basis vectors for density (higher=more expressive but more memory)')
+    parser.add_argument('--global_basis_k_app', type=int, default=96,
+                        help='Number of global basis vectors for appearance')
 
     # ===== Patch Continuity / Residual & Seam (Model toggles) =====
     parser.add_argument('--enable_child_residual', type=_parse_bool, default=True,
@@ -240,6 +248,8 @@ def config_parser(cmd=None):
     parser.add_argument('--critrn_mode', type=str, default='hybrid',
                         choices=['split', 'vm', 'hybrid'],
                         help='refinement mode: split-only, VM-upgrade-only, or hybrid')
+    parser.add_argument('--critrn_every', type=int, default=1500, 
+                        help='apply uneven criterion every N iterations (reduce for faster training)')
     parser.add_argument('--critrn_vm_topk', type=int, default=8,
                         help='max number of patches to VM-upgrade per criterion pass')
     parser.add_argument('--critrn_split_topk', type=int, default=4,
@@ -248,13 +258,14 @@ def config_parser(cmd=None):
                         help='start iteration to use focus sampling around activated patches')
     parser.add_argument('--critrn_focus_halo', type=int, default=1,
                         help='Chebyshev halo in patch-grid for focus sampling (neighbors in +/- halo)')
-    parser.add_argument('--critrn_focus_samples', type=int, default=8,
+    parser.add_argument('--critrn_focus_samples', type=int, default=4,
                         help='per-ray samples used to build focus map')
     parser.add_argument('--critrn_min_total_rays', type=int, default=2000,
                         help='min number of rays aggregated across views for a patch to be evaluated')
     parser.add_argument('--critrn_global_mix_ratio', type=float, default=0.3,
                         help='fraction of non-focus rays mixed with focus rays per view')
-    parser.add_argument('--critrn_sample_rays', type=int, default=2048)
+    parser.add_argument('--critrn_sample_rays', type=int, default=1024,
+                        help='number of rays to sample per view for criterion evaluation')
     parser.add_argument('--critrn_vm_metric', type=str, default='gain_per_mem',
                         choices=['gain_per_mem', 'margin'],
                         help='ranking metric for VM upgrades')
@@ -402,7 +413,7 @@ def config_parser(cmd=None):
                         help='allow autoscale to increase ranks during post-VM only (usually keep False; can be True in probation)')
     
     # === Post-split field knowledge distillation (KD) ===  
-    parser.add_argument('--post_event_kd', type=int, default=1,
+    parser.add_argument('--post_event_kd', type=int, default=0,
                         help='enable short-horizon field KD after split (0/1)')
     parser.add_argument('--post_event_kd_every', type=int, default=2,
                         help='apply field KD every N iterations after a split (1 = every iter)')
