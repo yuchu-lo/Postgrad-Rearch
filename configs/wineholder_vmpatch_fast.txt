@@ -19,6 +19,11 @@ init_grid_res = [2, 2, 2]
 init_vm_res = [8, 8, 8]
 rank_min_res = 8
 
+use_progressive_resolution = 1
+ppr_min_res = 8
+ppr_max_res = 64
+ppr_importance_threshold = 0.7
+
 strict_even_kick = 1500               
 strict_even_target_G = [3, 3, 3]      
 strict_even_warmup_iters = 300 
