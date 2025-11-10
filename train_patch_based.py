@@ -2996,73 +2996,80 @@ def reconstruction(args):
 
                     before_res = sorted({tuple(p['res']) for p in tensorf.patch_map.values()})
 
-                    sel_keys, eligible = tensorf.select_patches_by_alpha_mass(
-                        tuple(reso_target), ratio=ratio, topk=topk, min_k=min_k, max_k=max_k
-                    )
-
-                    # top-K selected by content complexity
-                    def content_aware_selection(tensorf, base_target, ratio, min_k, max_k):
-                        """根據內容複雜度決定每個 patch 的目標解析度"""
+                    def select_patches_by_content_priority(tensorf, reso_target, ratio, min_k, max_k, current_iter):
+                        """基於 criterion 評估結果選擇 patches"""
                         candidates = []
                         
                         for key, patch in tensorf.patch_map.items():
-                            current_res = patch['res'][0]  # 假設各軸相同
-                            complexity = patch.get('content_complexity', 
-                                                patch.get('roughness', 0.5))
-                            alpha_mass = patch.get('alpha_mass', 0.0)
+                            # 跳過不符合條件的
+                            current_res = patch['res'][0]
+                            if current_res >= reso_target[0]:
+                                continue
+                                
+                            # 使用 criterion 的評估結果
+                            last_eval = patch.get('last_eval_iteration', 0)
+                            if current_iter - last_eval > 2000:  # 資訊太舊，使用 alpha_mass
+                                priority = patch.get('alpha_mass', 0.0)
+                            else:
+                                # 優先使用 gain_per_mem（criterion 的核心指標）
+                                priority = patch.get('last_eval_gain_per_mem', 0.0)
+                                if priority == 0:  # fallback
+                                    priority = patch.get('alpha_mass', 0.0)
                             
-                            # 根據複雜度決定目標解析度上限
-                            if complexity < 0.2:  # 平滑區域
-                                patch_target = min(current_res * 1.5, 64)
-                            elif complexity < 0.5:  # 中等複雜度
-                                patch_target = min(current_res * 2, 96)
-                            else:  # 高複雜度
-                                patch_target = min(current_res * 2, base_target[0])
+                            complexity = patch.get('last_eval_roughness', 0.5)
                             
-                            # 計算提升效益
-                            if patch_target > current_res:
-                                benefit = alpha_mass * complexity * (patch_target - current_res) / current_res
-                                candidates.append({
-                                    'key': key,
-                                    'target': (patch_target, patch_target, patch_target),
-                                    'benefit': benefit,
-                                    'complexity': complexity
-                                })
+                            candidates.append({
+                                'key': key,
+                                'priority': priority,
+                                'complexity': complexity
+                            })
                         
-                        # 按效益排序，選擇 top-k
-                        candidates.sort(key=lambda x: x['benefit'], reverse=True)
+                        # 按優先級排序
+                        candidates.sort(key=lambda x: x['priority'], reverse=True)
                         
-                        # 動態決定選擇數量
+                        # 選擇 top-k
                         k = min(max_k, max(min_k, int(len(candidates) * ratio)))
-                        
-                        selected = candidates[:k]
-                        return selected
+                        return candidates[:k]
 
                     # 使用新的選擇邏輯
-                    selected_patches = content_aware_selection(
-                        tensorf, reso_target, ratio, min_k, max_k
+                    selected = select_patches_by_content_priority(
+                        tensorf, reso_target, ratio, min_k, max_k, iteration
                     )
 
                     log_event(logfolder, "vm-ups-select", iteration,
                               topk=(int(topk_arg) if topk_arg is not None else -1),
-                              ratio=ratio, eligible=eligible, picked=len(sel_keys),
+                              ratio=ratio, selected=len(selected),
                               res_before=str(before_res),
                               target=str(reso_target))
 
-                    def get_resolution_cap_by_depth(key, grid_reso, base_max=128):
-                        """深度越深，允許的最大解析度越低"""
-                        depth = get_split_depth(key, grid_reso) 
+                    groups = defaultdict(list)
+                    for item in selected:
+                        key = item['key']
+                        complexity = item['complexity']
+                        depth = get_split_depth(key, tensorf.patch_grid_reso)
                         
-                        caps = {
-                            0: base_max,      # 未 split：128
-                            1: min(96, base_max),   # split 1次：96
-                            2: min(64, base_max),   # split 2次：64
-                            3: min(48, base_max),   # split 3次：48
-                        }
+                        # 決定目標解析度
+                        base = reso_target[0]
                         
-                        return caps.get(depth, 32)
+                        # 深度限制
+                        if depth >= 3:
+                            base = min(base, 48)
+                        elif depth >= 2:
+                            base = min(base, 64)
+                        elif depth >= 1:
+                            base = min(base, 96)
+                        
+                        # 複雜度調整
+                        if complexity < 0.2:  # 平滑
+                            target = min(base, 64)
+                        elif complexity < 0.5:  # 中等
+                            target = min(base, 96)
+                        else:  # 複雜
+                            target = base
+                        
+                        groups[target].append(item['key'])
 
-                    if len(sel_keys) == 0:
+                    if len(selected) == 0:
                         print("[per-patch upsample] no eligible patches this round; skip.")
                     else:
                         if hasattr(tensorf, "eval"): tensorf.eval()
@@ -3090,43 +3097,18 @@ def reconstruction(args):
 
                         pre_event_batch = int(getattr(args, "batch_size", 2048))
 
-                        
                         adjust_batch_size(reso_target, args)
 
-                        def memory_safe_upsample(tensorf, selected_patches, budget_mb):
-                            """分批執行 upsample，避免 OOM"""
-                            current_mem = tensorf.get_total_mem()
-                            budget = budget_mb * 1024**2
-                            
-                            promoted = []
-                            for item in selected_patches:
-                                key = item['key']
-                                target_res = item['target']
-                                patch = tensorf.patch_map[key]
-                                
-                                # 估算記憶體增長
-                                current_res = patch['res'][0]
-                                delta_factor = (target_res[0] / current_res) ** 3
-                                patch_mem = estimate_patch_memory(patch)  
-                                delta_mem = patch_mem * (delta_factor - 1)
-                                
-                                if current_mem + delta_mem > budget * 0.9:
-                                    print(f"[VM-ups] Memory limit reached, promoted {len(promoted)}/{len(selected_patches)}")
-                                    break
-                                
-                                # actually upgrade res in patches
-                                success = tensorf.upsample_patches(
-                                    [key], target_res, mode="bilinear", 
-                                    align_corners=False, verbose=False
+                        n_promoted = 0
+                        for target_res, keys in groups.items():
+                            if keys:
+                                target_tuple = (target_res, target_res, target_res)
+                                promoted = tensorf.upsample_patches(
+                                    keys, target_tuple, mode="bilinear", 
+                                    align_corners=False, verbose=True
                                 )
-                                
-                                if success:
-                                    promoted.append(key)
-                                    current_mem += delta_mem
-                            
-                            return promoted
-
-                        n_promoted = len(memory_safe_upsample(tensorf, selected_patches, VRAM_BUDGET_MB))
+                                n_promoted += promoted
+                                print(f"[VM-ups] {promoted} patches → {target_tuple} (complexity-aware)")
 
                         _ = event_full_recover(tensorf, note="post-VM-upsample", iteration=iteration, reso_cur=reso_cur)
                         did_cov_this_step = True
@@ -3141,7 +3123,7 @@ def reconstruction(args):
                         
                         topk_disp = topk if topk is not None else f"ratio*{ratio:.2f}[{min_k},{max_k}]"
                         print(f"[sanity] vm_upsample@{iteration} res_before={before_res} res_after={after_res} "
-                              f"selected={len(sel_keys)} upgraded={n_promoted} topk={topk_disp}")
+                              f"selected={len(selected)} upgraded={n_promoted} topk={topk_disp}")
 
                         if n_promoted > 0:
                             # Post-UPS quick health check → Immediate abort OR start probation
@@ -3175,9 +3157,9 @@ def reconstruction(args):
                                 log_patch_status(tensorf, iteration, "restore/load")
                                 if hasattr(tensorf, "train"): tensorf.train()
                                 log_event(logfolder, "vm-upsample-rollback", iteration,
-                                        prev_n=prev_n, new_n=len(tensorf.patch_map),
-                                        miss_before=f"{miss_b:.2%}", miss_after=f"{miss_a:.2%}",
-                                        dpsnr=f"{(post_psnr_fast or 0)-(pre_psnr_fast or 0):+.4f}dB", reason="immediate_abort")
+                                          prev_n=prev_n, new_n=len(tensorf.patch_map),
+                                          miss_before=f"{miss_b:.2%}", miss_after=f"{miss_a:.2%}",
+                                          dpsnr=f"{(post_psnr_fast or 0)-(pre_psnr_fast or 0):+.4f}dB", reason="immediate_abort")
                                 print(f"[vm-upsample] immediate rollback @ {iteration}: ΔPSNR={(post_psnr_fast or 0)-(pre_psnr_fast or 0):+.4f} dB")
                                 continue
 
@@ -3201,7 +3183,7 @@ def reconstruction(args):
 
                             reso_cur = reso_target
                             summary_writer.add_scalar('events/vm_promoted', n_promoted, iteration)
-                            log_event(logfolder, "perpatch-ups", iteration, promoted=len(sel_keys), target_res=tuple(reso_cur))
+                            log_event(logfolder, "perpatch-ups", iteration, promoted=n_promoted, target_res=tuple(reso_cur))
                             with open(os.path.join(logfolder, 'vm_upsampling_reso.txt'), 'a') as f:
                                 f.write(f"Iter {iteration} per-patch upsample → {reso_cur}\n")
                             
