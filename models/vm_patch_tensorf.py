@@ -129,13 +129,13 @@ class TensorVMSplitPatch(TensorBase):
         
         self.patch_map = {}
         self.patch_grid_reso = patch_grid_reso
-        self._basis_bank = torch.nn.ModuleDict()
         self._basis_registry = {}
-        self._seam_banks = torch.nn.ModuleDict()
         self._last_rank_resize_iter = None
         
         super().__init__(aabb, gridSize, device, **kargs)
         
+        self._basis_bank = torch.nn.ModuleDict()
+        self._seam_banks = torch.nn.ModuleDict()
         self.basis_dtype = getattr(self, "basis_dtype", torch.float32)
         
         if self.global_basis_enable:
