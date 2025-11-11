@@ -265,8 +265,8 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
 
     for key in patch_keys:
         p = tensorf.patch_map[key]
-        dp, dl  = p["density_plane"], p["density_line"]
-        ap, al  = p["app_plane"],     p["app_line"]
+        dp, dl  = p['density_plane'], p['density_line']
+        ap, al  = p['app_plane'],     p['app_line']
         complexity = tensorf.compute_patch_complexity(p)
 
         _uk = (key, _res_key)
@@ -276,11 +276,11 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
             if getattr(args, 'use_progressive_resolution', False):
                 # 計算此 patch 的 PPR 目標解析度
                 patch_importance = p.get('alpha_mass', 0.5)
-                if hasattr(p, '_complexity_cache'):
-                    patch_complexity = p._complexity_cache
+                if '_complexity_cache' in p:
+                    patch_complexity = p['_complexity_cache']
                 else:
                     patch_complexity = tensorf.compute_patch_complexity(p)
-                    p._complexity_cache = patch_complexity
+                    p['_complexity_cache'] = patch_complexity
                 
                 ppr_target = tensorf.get_progressive_resolution(step, max(patch_importance, patch_complexity))
                 # 使用 PPR 目標但不超過 res_target
@@ -421,8 +421,11 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
         complexity_factor = 1.0 - complexity * 0.5  # 複雜區域 cost 降低最多 50%
         split_cost = split_cost * complexity_factor
 
-        p['roughness'] = rough_avg  
-        p['content_complexity'] = rough_avg * (1.0 if avg_gain > 0 else 0.5)  
+        p['last_eval_margin'] = avg_margin
+        p['last_eval_roughness'] = rough_avg
+        p['last_eval_gain_per_mem'] = gain_per_mem
+        p['last_eval_iteration'] = step  
+        p['content_complexity'] = rough_avg * (1.0 if avg_gain > 0 else 0.5) 
 
         candidates.append({
             "key": key,
@@ -523,10 +526,10 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
     if getattr(args, 'use_progressive_resolution', False):
         print("[uneven_critrn] Pre-computing patch complexity for PPR...")
         for key, patch in tensorf.patch_map.items():
-            if not hasattr(patch, '_complexity_cache') or patch.get('_last_complexity_update', 0) < step - 1000:
+            if '_complexity_cache' not in patch or patch.get('_last_complexity_update', 0) < step - 1000:
                 complexity = tensorf.compute_patch_complexity(patch)
-                patch._complexity_cache = complexity
-                patch._last_complexity_update = step
+                patch['_complexity_cache'] = complexity
+                patch['_last_complexity_update'] = step
 
     max_by_ratio = max(1, int(len(candidates) * frac))
     max_by_abs   = max(1, min(6, int(0.10 * max(1, len(patch_keys)))))
@@ -535,14 +538,14 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
 
     # --- Build rankings ---
     if vm_metric == "gain_per_mem":
-        cand_vm_sorted = sorted(candidates, key=lambda d: (-d.get("gain_per_mem", 0.0), d["avg_margin"]))
+        cand_vm_sorted = sorted(candidates, key=lambda d: (-d.get("gain_per_mem", 0.0), d['avg_margin']))
     else:  
-        cand_vm_sorted = sorted(candidates, key=lambda d: d["avg_margin"])
+        cand_vm_sorted = sorted(candidates, key=lambda d: d['avg_margin'])
 
     def split_score(d):
-        base_score = d["avg_margin"] + d["split_cost"]
+        base_score = d['avg_margin'] + d['split_cost']
         # 複雜區域加分（優先 split）
-        complexity_bonus = -d["complexity"] * 0.3
+        complexity_bonus = -d['complexity'] * 0.3
         return base_score + complexity_bonus
     
     cand_split_sorted = sorted(candidates, key=split_score)
@@ -552,7 +555,7 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
     if floor_min_res > 0 and vm_budget > 0:
         low = []
         for d in candidates:
-            k = d["key"]; p = tensorf.patch_map.get(k, {})
+            k = d['key']; p = tensorf.patch_map.get(k, {})
             r = p.get("res", (0,0,0))
             if min(r) < floor_min_res and _can_vm_upgrade(p):
                 # 重要度：優先用 gain_per_mem，否則 roughness+反向margin
@@ -570,7 +573,7 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
         for d in cand_vm_sorted:
             if len(to_promote) >= vm_budget:
                 break
-            k = d["key"]
+            k = d['key']
             if k in to_promote:
                 continue
             p = tensorf.patch_map[k]
@@ -582,7 +585,7 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
         rejected_splits = []
         
         for d in cand_split_sorted[:split_budget]:
-            key = d["key"]
+            key = d['key']
             patch = tensorf.patch_map[key]
             
             # 安全檢查
@@ -593,7 +596,7 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
                 continue
             
             # 內容複雜度檢查（使用動態門檻）
-            if d["avg_margin"] + d["split_cost"] > tau:
+            if d['avg_margin'] + d['split_cost'] > tau:
                 rejected_splits.append((key, "complexity_threshold"))
                 continue
                 
@@ -601,7 +604,7 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
         
         # 只選擇安全的 splits
         for d in safe_splits[:split_topk]:
-            to_split.append(d["key"])
+            to_split.append(d['key'])
         
         # 記錄被拒絕的 splits（用於 debug）
         if len(rejected_splits) > 0:
@@ -628,11 +631,11 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
                 importance = patch.get('alpha_mass', 0.5)
                 
                 # 使用已計算的複雜度（如果有）
-                if hasattr(patch, '_complexity_cache'):
-                    complexity = patch._complexity_cache
+                if '_complexity_cache' in patch:
+                    complexity = patch['_complexity_cache']
                 else:
                     complexity = tensorf.compute_patch_complexity(patch)
-                    patch._complexity_cache = complexity
+                    patch['_complexity_cache'] = complexity
                 
                 combined_score = max(importance, complexity)
                 
@@ -647,14 +650,14 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
                     print(f"[PUF-PPR] Patch {key}: {current_res} -> {target_res_final} (imp={importance:.3f}, comp={complexity:.3f})")
                     
                     # 執行 upsample
-                    dp_up, dl_up = tensorf.upsample_VM(patch["density_plane"], patch["density_line"], target_res_final)
-                    ap_up, al_up = tensorf.upsample_VM(patch["app_plane"], patch["app_line"], target_res_final)
+                    dp_up, dl_up = tensorf.upsample_VM(patch['density_plane'], patch['density_line'], target_res_final)
+                    ap_up, al_up = tensorf.upsample_VM(patch['app_plane'], patch['app_line'], target_res_final)
                     
-                    patch["density_plane"] = dp_up
-                    patch["density_line"] = dl_up
-                    patch["app_plane"] = ap_up
-                    patch["app_line"] = al_up
-                    patch["res"] = list(target_res_final)
+                    patch['density_plane'] = dp_up
+                    patch['density_line'] = dl_up
+                    patch['app_plane'] = ap_up
+                    patch['app_line'] = al_up
+                    patch['res'] = list(target_res_final)
                     
                     actually_promoted += 1
             
@@ -773,8 +776,8 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
                     parent_importance = parent.get('alpha_mass', 0.5)
                     
                     # 獲取父 patch 複雜度
-                    if hasattr(parent, '_complexity_cache'):
-                        parent_complexity = parent._complexity_cache
+                    if '_complexity_cache' in parent:
+                        parent_complexity = parent['_complexity_cache']
                     else:
                         parent_complexity = tensorf.compute_patch_complexity(parent)
                     
@@ -795,7 +798,7 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
                     print(f"[PPR-split] Parent {key} (res={parent_res}, imp={parent_importance:.3f}) -> children (res={child_res})")
                 else:
                     # 原始邏輯：子 patch 保持父 patch 的解析度
-                    child_res = parent["res"]
+                    child_res = parent['res']
                 
                 children = tensorf.split_patch(key, parent, child_res)
                 new_map.update(children)
@@ -853,7 +856,7 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
             if n_pick > 0:
                 keys_boost = [k for _, k in scored[:n_pick]]
                 any_child = tensorf.patch_map[keys_boost[0]]
-                r0 = tuple(int(x) for x in any_child["res"])
+                r0 = tuple(int(x) for x in any_child['res'])
                 r_boost = tuple(int(min(VM_MAX, max(x, math.ceil(x * boost_factor)))) for x in r0)
 
                 promoted = tensorf.upsample_patches(

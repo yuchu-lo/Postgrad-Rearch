@@ -1259,7 +1259,6 @@ def reconstruction(args):
             max_rank=args.max_rank,
             repair_enable=args.repair_enable,
             repair_tau=args.repair_tau,
-            repair_adjacent_only=args.repair_adjacent_only,
             repair_grad_scale_sigma=args.repair_grad_scale_sigma,
             repair_grad_scale_app=args.repair_grad_scale_app,
             seam_lowrank_enable=args.seam_lowrank_enable,

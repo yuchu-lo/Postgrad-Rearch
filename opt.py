@@ -171,8 +171,6 @@ def config_parser(cmd=None):
     parser.add_argument('--repair_warmup', type=int, default=500)
     parser.add_argument('--repair_tau', type=float, default=0.0,
                         help='repair threshold (<=0 derive from stats)')
-    parser.add_argument('--repair_adjacent_only', action='store_true',
-                        help='only snap to adjacent patches')
     parser.add_argument('--repair_grad_scale_sigma', type=float, default=1.0,
                         help='gradient scale for density repair')
     parser.add_argument('--repair_grad_scale_app', type=float, default=1.0,
