@@ -204,6 +204,7 @@ class GlobalBasisWrapper(torch.nn.Module):
     """包裝器，讓全域基底用起來像普通的 Linear layer"""
     def __init__(self, manager, patch_key, in_dim):
         super().__init__()
+
         self.manager = manager
         self.patch_key = patch_key
         self.in_features = in_dim
@@ -215,6 +216,7 @@ class GlobalBasisWrapper(torch.nn.Module):
             coeffs = torch.nn.Linear(in_dim, manager.n_basis, bias=False, device=manager.device, dtype=manager.dtype)
             torch.nn.init.xavier_uniform_(coeffs.weight, gain=0.1)
             manager.patch_coeffs[key_str] = coeffs
+
         self.coeffs = manager.patch_coeffs[key_str]
     
     def forward(self, x):
@@ -308,7 +310,7 @@ class TensorVMSplitPatch(TensorBase):
         
         for pid, p in self.patch_map.items():
             self._validate_one_patch_shapes(f"{pid[0]}_{pid[1]}_{pid[2]}", p)
-    
+        
     @staticmethod
     def _grad_scale(x, g):
         # g could be float or tensor; only grad changes and forward value does not
@@ -749,6 +751,7 @@ class TensorVMSplitPatch(TensorBase):
         if self.use_shared_basis and hasattr(self, 'shared_basis_manager'):
             temp_key = (0, 0, 0)  
             in_dim = self.total_feat_dim 
+
             basis = self.shared_basis_manager.get_or_create_basis(
                 temp_key, 
                 in_dim,
@@ -1168,7 +1171,7 @@ class TensorVMSplitPatch(TensorBase):
         gz = self._gs1d_1CL1(lz, xyz[:, [2]])     # [N, Cz]
         
         sigma_feature = self.compute_densityfeature_patch(patch, xyz)  # [N, density_dim]
-        app_features = torch.cat([fx, fy, fz, gx, gy, gz], dim=1)  # (N, app_feat_dim)
+        app_features = torch.cat([fx, fy, fz, gx, gy, gz], dim=1)  # [N, app_feat_dim]
 
         # interior-gated residuals
         if bool(getattr(self, "enable_child_residual", True)):
@@ -1179,7 +1182,14 @@ class TensorVMSplitPatch(TensorBase):
                 g = self._interior_gate(xyz)  # [N,1]
                 app_features = app_features + g * rfeat
 
-        combined_feat = torch.cat([sigma_feature, app_features], dim=-1)  # [N, total_feat_dim]
+        combined_feat = torch.cat([sigma_feature, app_features], dim=-1) 
+        actual_dim = combined_feat.shape[1]
+
+        print(f"\n[compute_app_patch] Feature dimensions:")
+        print(f"  sigma_feature: {sigma_feature.shape}")
+        print(f"  app_features: {app_features.shape}") 
+        print(f"  combined_feat: {combined_feat.shape}")
+        print(f"  self.total_feat_dim: {self.total_feat_dim}")
 
         # 使用 SharedBasisManager 或傳統 basis_mat
         if hasattr(self, 'shared_basis_manager') and self.shared_basis_manager.mode == 'global':
@@ -1194,15 +1204,22 @@ class TensorVMSplitPatch(TensorBase):
                 if patch_key is None:
                     patch_key = (0, 0, 0)  
             
+            # 檢查是否需要創建或更新 basis_mat
+            need_new_basis = False
             if 'basis_mat' not in patch:
-                # 第一次使用，創建 wrapper
+                need_new_basis = True
+            elif hasattr(patch['basis_mat'], 'in_features'):
+                if patch['basis_mat'].in_features != actual_dim:
+                    need_new_basis = True
+                    
+            if need_new_basis:
                 patch['basis_mat'] = self.shared_basis_manager.get_or_create_basis(
-                    patch_key, combined_feat.shape[1], {'res': patch.get('res', [32,32,32])}
+                    patch_key, actual_dim, {'res': patch.get('res', [32,32,32])}
                 )
             out = patch['basis_mat'](combined_feat)  # GlobalBasisWrapper.forward
         else:
             # 傳統路徑：每個 patch 有自己的 basis_mat
-            self._ensure_basis_for_feat(patch, combined_feat.shape[1])
+            self._ensure_basis_for_feat(patch, actual_dim)
             out = patch['basis_mat'](combined_feat)  # [N, app_dim]
 
         # seam blending near patch faces
@@ -1707,6 +1724,24 @@ class TensorVMSplitPatch(TensorBase):
 
             upcnt += 1
 
+        # 清理受影響的 basis（維度已經改變）
+        if upcnt > 0 and hasattr(self, 'shared_basis_manager'):
+            for key, _, _ in picked:
+                P = self.patch_map[key]
+                if 'basis_mat' in P:
+                    del P['basis_mat']
+            
+            # 清理 SharedBasisManager 中對應的 coeffs
+            cleaned_keys = []
+            for key, _, _ in picked:
+                key_str = f"{key[0]}_{key[1]}_{key[2]}"
+                if key_str in self.shared_basis_manager.patch_coeffs:
+                    del self.shared_basis_manager.patch_coeffs[key_str]
+                    cleaned_keys.append(key_str)
+            
+            if verbose and cleaned_keys:
+                print(f"[rank] Cleared basis for {len(cleaned_keys)} patches: {cleaned_keys}")
+
         if verbose:
             print(f"[rank] upgraded {upcnt} patches | Δ≈{acc/1024/1024:.2f} MB | min_res≥{min_patch_res} | budget_mb={budget_mb}")
         return upcnt
@@ -1937,9 +1972,17 @@ class TensorVMSplitPatch(TensorBase):
                 P['app_plane_res'] = torch.nn.ParameterList(new_ap_res)
                 P['app_line_res']  = torch.nn.ParameterList(new_al_res)
 
-            if app_changed and 'basis_mat' in P and hasattr(self, '_app_in_dim_from_vm'):
-                new_in = self._app_in_dim_from_vm(P['app_plane'], P['app_line'])
-                P['basis_mat'] = self.get_shared_basis(new_in, self.app_dim)
+            # 如果維度改變了，清理 basis_mat（density 或 app 任一改變都需要）
+            dim_changed = (new_sig_axes != cur_sig_axes) or (new_app_axes != cur_app_axes)
+            if dim_changed:
+                if 'basis_mat' in P:
+                    del P['basis_mat']
+                
+                # 如果使用 SharedBasisManager，也清理對應的 coeffs
+                if hasattr(self, 'shared_basis_manager'):
+                    key_str = f"{key[0]}_{key[1]}_{key[2]}"
+                    if key_str in self.shared_basis_manager.patch_coeffs:
+                        del self.shared_basis_manager.patch_coeffs[key_str]
 
             changed += 1
 
