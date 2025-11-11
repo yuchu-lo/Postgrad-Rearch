@@ -13,8 +13,8 @@ patch_cap = 64
 voxel_budget = 10000000
 vram_budget_MB = 3000
 
-N_voxel_init = 32768 # 32**3
-N_voxel_final = 262144 # 64**3
+N_voxel_init = 32768    # 32**3
+N_voxel_final = 262144  # 64**3
 init_grid_res = [2, 2, 2]
 init_vm_res = [8, 8, 8]
 rank_min_res = 8
@@ -24,12 +24,16 @@ ppr_min_res = 8
 ppr_max_res = 32
 ppr_importance_threshold = 0.5
 
-strict_even_kick = 400               
+strict_even_kick = 100               
 strict_even_target_G = [3, 3, 3]      
-strict_even_warmup_iters = 100
+strict_even_warmup_iters = 50
 
-split_even_kicks = [200, 500, 800]
-vm_upsamp_list = [300, 600]
+split_even_kicks = [300, 600, 800]
+vm_upsamp_list = [200]
+
+split_warmup_iters = 0 
+split_min_vm_res = 8     
+split_min_feat_dim = 32   
 
 split_cooldown = 200
 split_psnr_drop_thres = 0.5

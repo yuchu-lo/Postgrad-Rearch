@@ -1,11 +1,10 @@
-
 dataset_name = nsvf
 datadir = ./data/Synthetic_NSVF/Wineholder
-expname = Wineholder_VMpatch_E2U
+expname = Wineholder_VMpatch_sharedBasis_PPR
 basedir = ./log
 model_name = TensorVMSplitPatch
 
-n_iters = 50000
+n_iters = 40000
 batch_size = 2048
 
 vm_reso_max = 64 
@@ -13,8 +12,8 @@ patch_cap = 96
 voxel_budget = 20000000
 vram_budget_MB = 6000
 
-N_voxel_init = 2097156 # 128**3
-N_voxel_final = 27000000 # 300**3
+N_voxel_init = 2097156    # 128**3
+N_voxel_final = 27000000  # 300**3
 init_grid_res = [2, 2, 2]
 init_vm_res = [8, 8, 8]
 rank_min_res = 8
@@ -27,12 +26,17 @@ ppr_importance_threshold = 0.7
 strict_even_kick = 1500               
 strict_even_target_G = [3, 3, 3]      
 strict_even_warmup_iters = 300 
-split_even_kicks = [2500, 4000, 6500, 10000, 15000]
-vm_upsamp_list = [18000, 24000]
 
-split_cooldown = 800
+split_even_kicks = [3500, 7000, 12000, 20000, 30000]
+vm_upsamp_list = [2000, 9000, 22000]
+
+split_warmup_iters = 2500   
+split_min_vm_res = 16       
+split_min_feat_dim = 64 
+
+split_cooldown = 1200  
 split_psnr_drop_thres = 0.3
-split_after_upsamp_offset = 800
+split_after_upsamp_offset = 1000  
 
 heartbeat_every = 250
 vis_every = 5000
@@ -51,18 +55,24 @@ lr_upsample_reset = 0
 
 L1_weight_inital = 8e-5
 L1_weight_rest = 4e-5
-TV_weight_density = 0.0
-TV_weight_app = 0.0
+TV_weight_density = 1e-4  
+TV_weight_app = 5e-5      
 
 critrn_lambda = 0.5
 logmargin_base = 1.05
 critrn_accept_ratio = 0.5
 critrn_refine_frac = 0.3
-puf_alpha_boundary = 0.4
-boundary_smooth_strength = 1.5
+
+puf_alpha_boundary = 0.3  
+boundary_smooth_strength = 1.2  
 
 shadingMode = MLP_Fea
 fea2denseAct = softplus
 view_pe = 2
 fea_pe = 2
 rm_weight_mask_thre = 1e-4
+
+basis_mode = global
+global_basis_enable = 1
+global_basis_k_sigma = 64
+global_basis_k_app = 128
