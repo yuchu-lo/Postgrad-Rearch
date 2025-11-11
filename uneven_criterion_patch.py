@@ -484,6 +484,20 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
     elif current_patch_count > 64:
         tau = tau - 0.1
 
+    # ----------------- rank candidates & decide ops -----------------
+    # original knobs
+    mode          = str((getattr(args, "critrn_mode", "hybrid") or "hybrid")).strip().lower()  #  "vm" | "split" | "hybrid"
+    vm_topk       = int(getattr(args, "critrn_vm_topk", 8))
+    split_topk    = int(getattr(args, "critrn_split_topk", 4))
+    VM_MAX        = int(getattr(args, "vm_reso_max", 128))
+    vox_budget    = int(getattr(args, "voxel_budget", 1e12))
+    vram_budgetMB = float(getattr(args, "vram_budget_MB", 1e9))
+
+    vm_metric         = str(getattr(args, "critrn_vm_metric", "gain_per_mem"))  # "gain_per_mem" | "margin"
+    floor_min_res     = int(getattr(args, "critrn_vm_floor_min", 0))            # e.g., 24 (0=disabled)
+    floor_share       = float(getattr(args, "critrn_vm_floor_share", 0.35))   
+    floor_min_count   = int(getattr(args, "critrn_vm_floor_min_count", 1)) 
+
     # 動態配額調整
     if progress < 0.3:
         split_topk = split_topk  # 前期正常
@@ -497,21 +511,6 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
         split_topk = min(split_topk, 2)
     if current_patch_count > 120:
         split_topk = min(split_topk, 1)
-
-
-    # ----------------- rank candidates & decide ops -----------------
-    # original knobs
-    mode          = str((getattr(args, "critrn_mode", "hybrid") or "hybrid")).strip().lower()  #  "vm" | "split" | "hybrid"
-    vm_topk       = int(getattr(args, "critrn_vm_topk", 8))
-    split_topk    = int(getattr(args, "critrn_split_topk", 4))
-    VM_MAX        = int(getattr(args, "vm_reso_max", 128))
-    vox_budget    = int(getattr(args, "voxel_budget", 1e12))
-    vram_budgetMB = float(getattr(args, "vram_budget_MB", 1e9))
-
-    vm_metric         = str(getattr(args, "critrn_vm_metric", "gain_per_mem"))  # "gain_per_mem" | "margin"
-    floor_min_res     = int(getattr(args, "critrn_vm_floor_min", 0))            # e.g., 24 (0=disabled)
-    floor_share       = float(getattr(args, "critrn_vm_floor_share", 0.35))   
-    floor_min_count   = int(getattr(args, "critrn_vm_floor_min_count", 1))      
 
     vox_now       = int(getattr(tensorf, "get_total_voxels", lambda: 0)())
     mem_now_MB    = float(getattr(tensorf, "get_total_mem",   lambda: 0)() / 1024**2)
@@ -855,14 +854,17 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
             n_pick = min(boost_vm_cap, max(0, int(math.ceil(len(scored) * boost_topq))))
             if n_pick > 0:
                 keys_boost = [k for _, k in scored[:n_pick]]
-                any_child = tensorf.patch_map[keys_boost[0]]
-                r0 = tuple(int(x) for x in any_child['res'])
-                r_boost = tuple(int(min(VM_MAX, max(x, math.ceil(x * boost_factor)))) for x in r0)
+                if len(keys_boost) > 0:
+                    any_child = tensorf.patch_map[keys_boost[0]]
+                    r0 = tuple(int(x) for x in any_child['res'])
+                    r_boost = tuple(int(min(VM_MAX, max(x, math.ceil(x * boost_factor)))) for x in r0)
 
-                promoted = tensorf.upsample_patches(
-                    keys_boost, r_boost, mode="bilinear", align_corners=False, verbose=False
-                )
-                print(f"[split-boost] promoted {promoted}/{len(keys_boost)} children -> {r_boost}")
+                    promoted = tensorf.upsample_patches(
+                        keys_boost, r_boost, mode="bilinear", align_corners=False, verbose=False
+                    )
+                    print(f"[split-boost] promoted {promoted}/{len(keys_boost)} children -> {r_boost}")
+                else:
+                    print("[INFO] No children to boost (keys_boost is empty)")
 
     tensorf.current_patch_keys = list(tensorf.patch_map.keys())
     try:

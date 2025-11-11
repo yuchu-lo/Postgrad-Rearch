@@ -1744,6 +1744,12 @@ def reconstruction(args):
                 removed = tensorf.shared_basis_manager.cleanup_unused(active_keys)
                 if removed > 0:
                     print(f"[Cleanup] Removed {removed} unused basis coefficient matrices")
+                
+                if iteration % 5000 == 0 and tensorf.shared_basis_manager.mode == 'global':
+                    old_n_basis = tensorf.shared_basis_manager.n_basis
+                    new_n_basis = tensorf.shared_basis_manager.prune_basis(threshold=0.01)
+                    if new_n_basis < old_n_basis:
+                        print(f"[Basis Pruning] {old_n_basis} -> {new_n_basis} basis vectors")
 
             if hasattr(tensorf, '_kd_buffers') and len(tensorf._kd_buffers) > 10:
                 tensorf._kd_buffers = tensorf._kd_buffers[-10:]  # last 10 new 
@@ -2594,17 +2600,38 @@ def reconstruction(args):
 
                 did_refilter = True
 
+        def can_split_now(tensorf, args, iteration):
+            """
+            Return (can_split: bool, reason: str)
+            """
+            print("[DEBUG] do can_split_now")
+
+            if iteration < args.split_warmup_iters:
+                return False, f"warmup (iter < {args.split_warmup_iters})"
+            
+            cur_vm_res = current_reso_hint(tensorf, mode="min")  # 取最小軸
+            min_vm_res = int(getattr(args, "split_min_vm_res", 16))
+            if min(cur_vm_res) < min_vm_res:
+                return False, f"VM res too low (min={min(cur_vm_res)} < {min_vm_res})"
+            
+            cur_feat_dim = sum(tensorf.app_n_comp)
+            min_feat_dim = int(getattr(args, "split_min_feat_dim", 64))
+            if cur_feat_dim < min_feat_dim:
+                return False, f"feat dim too low ({cur_feat_dim} < {min_feat_dim})"
+            
+            return True, "OK"  
+
         # ========== Selective-even splits ==========
         SELECTIVE_EVEN_KICKS = list(getattr(args, "split_even_kicks", []))
         HEALTH_DROP_THRES    = float(getattr(args, "split_psnr_drop_thres", 0.3))
-        
-        if iteration in SELECTIVE_EVEN_KICKS:
-            # slight structure rearrangement after a finer res mapping 
-            if getattr(tensorf, "_first_ups_done_iter", None) is None:     
-                print("[even-selective] gated: need a VM upsample first; skip")
-                continue
 
-            if iteration - last_structure_change_iter < args.split_cooldown:
+        if iteration in SELECTIVE_EVEN_KICKS:
+            can_split, split_reason = can_split_now(tensorf, args, iteration)
+            if not can_split:
+                print("[DEBUG] can not split")
+                log_event(logfolder, "even-selective-skip", iteration, reason=split_reason)
+                print(f"[even-selective] deferred at iter {iteration}: {split_reason}")
+            elif iteration - last_structure_change_iter < args.split_cooldown:
                 log_event(logfolder, "even-selective-skip", iteration, reason="cooldown")
                 print(f"[even-selective] cooldown skip @ {iteration}")
             elif len(tensorf.patch_map) >= args.patch_cap:
