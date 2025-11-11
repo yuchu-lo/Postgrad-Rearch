@@ -295,11 +295,10 @@ class TensorVMSplitPatch(TensorBase):
         
         self.density_dim = sum(self.density_n_comp)  
         self.app_feat_dim = sum(self.app_n_comp)     
-        self.total_feat_dim = self.density_dim + self.app_feat_dim
         
         if not hasattr(self, 'shared_basis_manager'):
             self.shared_basis_manager = SharedBasisManager(mode=basis_mode, n_basis=self.n_basis,
-                                                           input_dim=self.total_feat_dim,
+                                                           input_dim=self.app_feat_dim,
                                                            output_dim=self.app_dim,
                                                            device=device, dtype=self.basis_dtype,
                                                            sparsity_reg=kargs.pop("basis_sparsity_reg", 0.01),
@@ -750,7 +749,7 @@ class TensorVMSplitPatch(TensorBase):
 
         if self.use_shared_basis and hasattr(self, 'shared_basis_manager'):
             temp_key = (0, 0, 0)  
-            in_dim = self.total_feat_dim 
+            in_dim = self.app_feat_dim 
 
             basis = self.shared_basis_manager.get_or_create_basis(
                 temp_key, 
@@ -815,12 +814,12 @@ class TensorVMSplitPatch(TensorBase):
         if (patch_map is not None) and not isinstance(patch_map, dict):
             raise TypeError("set_patch(patch_map=...) expects a dict; did you mean patch_key=?")
 
-        dev = self.aabb.device
+        device = self.aabb.device
 
         def to_param_list(tensors):
             return torch.nn.ParameterList([
                 (t if isinstance(t, torch.nn.Parameter) else torch.nn.Parameter(t))
-                .detach().to(dev).requires_grad_()
+                .detach().to(device).requires_grad_()
                 for t in tensors
             ])
 
@@ -887,14 +886,14 @@ class TensorVMSplitPatch(TensorBase):
 
         Gx, Gy, Gz = map(int, grid_reso)
         Rx, Ry, Rz = map(int, vm_reso)
-        dev = self.aabb.device
+        device = self.aabb.device
 
         new_map = {}
-        template = self._create_patch([Rx, Ry, Rz], dev)  
+        template = self._create_patch([Rx, Ry, Rz], device)  
 
         def _clone_pl(pl):
             return torch.nn.ParameterList([
-                torch.nn.Parameter(p.detach().clone().to(dev), requires_grad=True) for p in pl
+                torch.nn.Parameter(p.detach().clone().to(device), requires_grad=True) for p in pl
             ])
 
         for i in range(Gx):
@@ -915,7 +914,7 @@ class TensorVMSplitPatch(TensorBase):
 
         self.patch_map = new_map
         self.current_patch_keys = list(self.patch_map.keys())
-        self.gridSize = torch.LongTensor([Rx, Ry, Rz]).to(dev)
+        self.gridSize = torch.LongTensor([Rx, Ry, Rz]).to(device)
         self.update_stepSize([Rx, Ry, Rz])
         self.patch_grid_reso = (Gx, Gy, Gz)
         self.assert_zero_origin_and_contiguous()
@@ -1112,40 +1111,6 @@ class TensorVMSplitPatch(TensorBase):
         sigma_acc = self._blend_with_neighbors_if_needed(patch, xyz_sampled, sigma_acc, kind="density")
         return sigma_acc
 
-    def compute_densityfeature_patch(self, patch, pts):
-        """
-        計算 density features（不含 feature2density 轉換）
-        - pts: [N,3] local coords in [0,1]
-        Returns:
-            density_feat: [N, density_dim]
-        """
-        coord_plane, coord_line = self._get_patch_coords(pts)
-        
-        # 收集所有 density features
-        features = []
-        for i, (plane, line) in enumerate(zip(patch['density_plane'], patch['density_line'])):
-            pfeat = self._gs2d_1CHW(plane, coord_plane[i])  # [N, C_i]
-            lfeat = self._gs1d_1CL1(line, coord_line[i])    # [N, C_i]
-            features.append(pfeat * lfeat)  # [N, C_i]
-        
-        density_feat = torch.cat(features, dim=1)  # [N, sum(density_n_comp)]
-        
-        # 加入 residual features
-        if bool(getattr(self, "enable_child_residual", True)):
-            rpl = patch.get('density_plane_res', None)
-            rln = patch.get('density_line_res', None)
-            if (rpl is not None) and (rln is not None):
-                g = self._interior_gate(pts)  # [N, 1]
-                res_features = []
-                for i, (rplane, rline) in enumerate(zip(rpl, rln)):
-                    rp = self._gs2d_1CHW(rplane, coord_plane[i])  # [N, C_i]
-                    rl = self._gs1d_1CL1(rline, coord_line[i])    # [N, C_i]
-                    res_features.append(rp * rl)
-                res_feat = torch.cat(res_features, dim=1)
-                density_feat = density_feat + g * res_feat
-        
-        return density_feat
-
     def compute_app_patch(self, patch, xyz):
         """
         Build appearance features and project via basis matrix.
@@ -1165,13 +1130,16 @@ class TensorVMSplitPatch(TensorBase):
         fx = self._gs2d_1CHW(px, xyz[:, [1, 2]])  # [N, Cx]
         fy = self._gs2d_1CHW(py, xyz[:, [0, 2]])  # [N, Cy]
         fz = self._gs2d_1CHW(pz, xyz[:, [0, 1]])  # [N, Cz]
-
         gx = self._gs1d_1CL1(lx, xyz[:, [0]])     # [N, Cx]
         gy = self._gs1d_1CL1(ly, xyz[:, [1]])     # [N, Cy]
         gz = self._gs1d_1CL1(lz, xyz[:, [2]])     # [N, Cz]
         
-        sigma_feature = self.compute_densityfeature_patch(patch, xyz)  # [N, density_dim]
-        app_features = torch.cat([fx, fy, fz, gx, gy, gz], dim=1)      # [N, app_feat_dim]
+        app_feat = torch.cat([fx, fy, fz, gx, gy, gz], dim=1)  # [N, app_feat_dim]
+        
+        if 'basis_mat' in patch:
+            print(f"  basis_mat type: {type(patch['basis_mat'])}")
+            if hasattr(patch['basis_mat'], 'in_features'):
+                print(f"  basis_mat.in_features: {patch['basis_mat'].in_features}")
 
         # interior-gated residuals
         if bool(getattr(self, "enable_child_residual", True)):
@@ -1180,10 +1148,18 @@ class TensorVMSplitPatch(TensorBase):
             if (rpl is not None) and (rln is not None):
                 rfeat = self._app_feat_raw(patch, xyz)
                 g = self._interior_gate(xyz)  # [N,1]
-                app_features = app_features + g * rfeat
+                app_feat = app_feat + g * rfeat
 
-        combined_feat = torch.cat([sigma_feature, app_features], dim=-1) 
-        actual_dim = combined_feat.shape[1]
+        actual_dim = app_feat.shape[1]
+
+        print(f"\n[compute_app_patch DEBUG]")
+        print(f"  fx.shape: {fx.shape}")
+        print(f"  fy.shape: {fy.shape}")
+        print(f"  fz.shape: {fz.shape}")
+        print(f"  gx.shape: {gx.shape}")
+        print(f"  gy.shape: {gy.shape}")
+        print(f"  gz.shape: {gz.shape}")
+        print(f"  app_features.shape: {app_feat.shape}")
 
         # 使用 SharedBasisManager 或傳統 basis_mat
         if hasattr(self, 'shared_basis_manager') and self.shared_basis_manager.mode == 'global':
@@ -1210,11 +1186,11 @@ class TensorVMSplitPatch(TensorBase):
                 patch['basis_mat'] = self.shared_basis_manager.get_or_create_basis(
                     patch_key, actual_dim, {'res': patch.get('res', [32,32,32])}
                 )
-            out = patch['basis_mat'](combined_feat)  # GlobalBasisWrapper.forward
+            out = patch['basis_mat'](app_feat)  # GlobalBasisWrapper.forward
         else:
             # 傳統路徑：每個 patch 有自己的 basis_mat
             self._ensure_basis_for_feat(patch, actual_dim)
-            out = patch['basis_mat'](combined_feat)  # [N, app_dim]
+            out = patch['basis_mat'](app_feat)  # [N, app_dim]
 
         # seam blending near patch faces
         out = self._blend_with_neighbors_if_needed(patch, xyz, out, kind="app")
@@ -1432,6 +1408,10 @@ class TensorVMSplitPatch(TensorBase):
         """
         device = self.aabb.device
         Gx, Gy, Gz = map(int, target_G)
+
+        if hasattr(self, 'shared_basis_manager'):
+            self.shared_basis_manager.patch_coeffs.clear()
+            print(f"[strict_evenize] Cleared all patch_coeffs at start")
         
         # 如果啟用漸進式解析度，根據迭代次數調整基礎解析度
         if use_progressive:
@@ -1561,7 +1541,7 @@ class TensorVMSplitPatch(TensorBase):
         Return new ParameterList (planes, lines) with C_new, copy-over min(C_old, C_new) channels.
         """
         new_planes, new_lines = [], []
-        dev = self.aabb.device
+        device = self.aabb.device
         for i in range(len(planes)):
             p = planes[i].detach()
             l = lines[i].detach()
@@ -1570,8 +1550,8 @@ class TensorVMSplitPatch(TensorBase):
             H, W  = p.shape[-2], p.shape[-1]
             L     = l.shape[-2]
 
-            p_new = torch.zeros((1, c_new, H, W), device=dev, dtype=p.dtype)
-            l_new = torch.zeros((1, c_new, L, 1), device=dev, dtype=l.dtype)
+            p_new = torch.zeros((1, c_new, H, W), device=device, dtype=p.dtype)
+            l_new = torch.zeros((1, c_new, L, 1), device=device, dtype=l.dtype)
 
             c_copy = min(c_old, c_new)
             if c_copy > 0:
@@ -1593,7 +1573,7 @@ class TensorVMSplitPatch(TensorBase):
         This version also upgrades *_res (residual) blocks to the SAME target ranks
         to keep feat and rfeat aligned in channel dimension.
         """
-        dev = self.aabb.device
+        device = self.aabb.device
         some_param = next((p for p in self.parameters() if p.requires_grad), None)
         dtype_bytes = 4
         if some_param is not None and some_param.dtype in (torch.float16, torch.bfloat16):
@@ -1851,7 +1831,7 @@ class TensorVMSplitPatch(TensorBase):
 
         changed = 0
         mem_before = int(self.get_total_mem() / 1024**2) if hasattr(self, 'get_total_mem') else -1
-        dev = self.aabb.device
+        device = self.aabb.device
 
         for key, P in list(self.patch_map.items()):
             # min(res) as scale anchor
@@ -1911,8 +1891,8 @@ class TensorVMSplitPatch(TensorBase):
                     else:
                         H_res, W_res = int(rpi.shape[-2]), int(rpi.shape[-1])
                         L_res        = int(rli.shape[-2])
-                        rp_new = torch.zeros((1, c_new, H_res, W_res), device=dev, dtype=rpi.dtype)
-                        rl_new = torch.zeros((1, c_new, L_res, 1),     device=dev, dtype=rli.dtype)
+                        rp_new = torch.zeros((1, c_new, H_res, W_res), device=device, dtype=rpi.dtype)
+                        rl_new = torch.zeros((1, c_new, L_res, 1),     device=device, dtype=rli.dtype)
 
                         # copy-aligned channels
                         if c_old_res > 0:
@@ -1950,8 +1930,8 @@ class TensorVMSplitPatch(TensorBase):
                     else:
                         H_res, W_res = int(rpi.shape[-2]), int(rpi.shape[-1])
                         L_res        = int(rli.shape[-2])
-                        rp_new = torch.zeros((1, c_new, H_res, W_res), device=dev, dtype=rpi.dtype)
-                        rl_new = torch.zeros((1, c_new, L_res, 1),     device=dev, dtype=rli.dtype)
+                        rp_new = torch.zeros((1, c_new, H_res, W_res), device=device, dtype=rpi.dtype)
+                        rl_new = torch.zeros((1, c_new, L_res, 1),     device=device, dtype=rli.dtype)
 
                         if c_old_res > 0:
                             k = min(len(keep), c_old_res)
@@ -2376,7 +2356,7 @@ class TensorVMSplitPatch(TensorBase):
         
         Returns two nn.ParameterLists: (upsampled_planes, upsampled_lines), each entry requiring grad.
         """
-        dev = self.aabb.device
+        device = self.aabb.device
         new_planes, new_lines = [], []
         with torch.no_grad():
             for i, plane in enumerate(plane_coef):
@@ -2388,8 +2368,8 @@ class TensorVMSplitPatch(TensorBase):
                 up_plane = self._interp2d_1CHW(plane, Ht, Wt)  # -> (C,Ht,Wt)
                 up_line = self._interp1d_1CL1(line, Lt)        # -> (1,C,Lt,1)
 
-                new_planes.append(up_plane.to(dev))
-                new_lines.append(up_line.to(dev))
+                new_planes.append(up_plane.to(device))
+                new_lines.append(up_line.to(device))
 
         param_planes = torch.nn.ParameterList([torch.nn.Parameter(t.detach().clone(), requires_grad=True) for t in new_planes])
         param_lines  = torch.nn.ParameterList([torch.nn.Parameter(t.detach().clone(), requires_grad=True) for t in new_lines])
@@ -2428,7 +2408,7 @@ class TensorVMSplitPatch(TensorBase):
     
     @torch.no_grad()
     def _resample_parent_to_child(self, parent_patch: dict, child_res: tuple, octant: tuple):
-        dev = self.aabb.device
+        device = self.aabb.device
         Rx, Ry, Rz = [int(x) for x in child_res]
         dx, dy, dz = [int(v) for v in octant]
 
@@ -2436,15 +2416,15 @@ class TensorVMSplitPatch(TensorBase):
         def _subgrid_2d(H, W, use_x, use_y):
             x0, x1 = (-1.0 + use_x * 1.0), (-1.0 + (use_x + 1) * 1.0)
             y0, y1 = (-1.0 + use_y * 1.0), (-1.0 + (use_y + 1) * 1.0)
-            xs = torch.linspace(x0, x1, W, device=dev)
-            ys = torch.linspace(y0, y1, H, device=dev)
+            xs = torch.linspace(x0, x1, W, device=device)
+            ys = torch.linspace(y0, y1, H, device=device)
             Y, X = torch.meshgrid(ys, xs, indexing='ij')
             return torch.stack([X, Y], dim=-1).unsqueeze(0).contiguous()  # (1,H,W,2) in [-1,1]
 
         # ------------- 1D subgrid（沿 L 軸；x 固定 0，y 走 [-1,1] 半域）-------------
         def _subgrid_1d(L, use_axis_half):
             y0, y1 = (-1.0 + use_axis_half * 1.0), (-1.0 + (use_axis_half + 1) * 1.0)
-            ys = torch.linspace(y0, y1, L, device=dev)  # (L,) in [-1,1]
+            ys = torch.linspace(y0, y1, L, device=device)  # (L,) in [-1,1]
             return ys.view(1, -1)  # (1, L)
 
         # --------- density ---------
@@ -2457,7 +2437,7 @@ class TensorVMSplitPatch(TensorBase):
             grid2d = _subgrid_2d(H, W, plane_use[i][0], plane_use[i][1])   # (1,H,W,2)
             dp = parent_patch['density_plane'][i]                           # (1,C,Hp,Wp) or (C,Hp,Wp)
             dpn = self._gs2d_by_grid(dp, grid2d)                            # (1,C,H,W)
-            dplanes_new.append(self._wrap_param(dpn.to(dev)))
+            dplanes_new.append(self._wrap_param(dpn.to(device)))
 
         Ls = [Rx, Ry, Rz]
         line_use = [dx, dy, dz]
@@ -2465,7 +2445,7 @@ class TensorVMSplitPatch(TensorBase):
             dl = parent_patch['density_line'][i]                            # (1,C,Lp,1) or (C,Lp,1)
             yL = _subgrid_1d(Ls[i], line_use[i])                            # (1,L)
             dln = self._gs1d_by_grid(dl, yL)                                # (1,C,L,1)
-            dlines_new.append(self._wrap_param(dln.to(dev)))
+            dlines_new.append(self._wrap_param(dln.to(device)))
 
         # --------- appearance ---------
         aplanes_new, alines_new = [], []
@@ -2474,13 +2454,13 @@ class TensorVMSplitPatch(TensorBase):
             grid2d = _subgrid_2d(H, W, plane_use[i][0], plane_use[i][1])
             ap = parent_patch['app_plane'][i]
             apn = self._gs2d_by_grid(ap, grid2d)                            # (1,C,H,W)
-            aplanes_new.append(self._wrap_param(apn.to(dev)))
+            aplanes_new.append(self._wrap_param(apn.to(device)))
 
         for i in range(3):
             al = parent_patch['app_line'][i]
             yL = _subgrid_1d(Ls[i], line_use[i])
             aln = self._gs1d_by_grid(al, yL)                                # (1,C,L,1)
-            alines_new.append(self._wrap_param(aln.to(dev)))
+            alines_new.append(self._wrap_param(aln.to(device)))
 
         return {
             'density_plane': torch.nn.ParameterList(dplanes_new),
@@ -2693,15 +2673,15 @@ class TensorVMSplitPatch(TensorBase):
         Writes patch['alpha_mass'] = mean alpha in [0,1].
         Cheap and robust; consistent with training alpha formula.
         """
-        dev = self.aabb.device
+        device = self.aabb.device
         scale = float(getattr(self, "alpha_gate_scale", 1.0))
 
         for key, patch in self.patch_map.items():
-            R = torch.tensor(patch['res'], device=dev, dtype=self.aabb.dtype)  # [Rx,Ry,Rz]
+            R = torch.tensor(patch['res'], device=device, dtype=self.aabb.dtype)  # [Rx,Ry,Rz]
             units = (self.aabb[1] - self.aabb[0]) / (R - 1).clamp(min=1)       # world-steps per axis
             step = float(units.mean() * self.step_ratio)                       # per-patch step
 
-            xyz = torch.rand((n_per, 3), device=dev) * 2 - 1
+            xyz = torch.rand((n_per, 3), device=device) * 2 - 1
             dens_feat = self.compute_density_patch(patch, xyz)
             sigma = self.feature2density(dens_feat)
             alpha = 1.0 - torch.exp(-sigma * step * scale)
@@ -2716,13 +2696,13 @@ class TensorVMSplitPatch(TensorBase):
         Estimate alpha_mass per patch by aggregating dense alpha volume samples.
         More global/stable; a bit heavier than per-patch sampling.
         """
-        dev = self.aabb.device
+        device = self.aabb.device
         a0, a1 = self.aabb[0], self.aabb[1]
 
         # build grid in world coords
-        xs = torch.linspace(0, 1, res, device=dev)
-        ys = torch.linspace(0, 1, res, device=dev)
-        zs = torch.linspace(0, 1, res, device=dev)
+        xs = torch.linspace(0, 1, res, device=device)
+        ys = torch.linspace(0, 1, res, device=device)
+        zs = torch.linspace(0, 1, res, device=device)
         X, Y, Z = torch.meshgrid(xs, ys, zs, indexing='ij')
         grid = torch.stack([X, Y, Z], dim=-1).view(-1, 3)  # [res^3,3] in [0,1]
         world = a0 + (a1 - a0) * grid                      # [N,3] world coords
@@ -2736,7 +2716,7 @@ class TensorVMSplitPatch(TensorBase):
         scale = float(getattr(self, "alpha_gate_scale", 1.0)) if apply_gate else 1.0
 
         # compute alpha in chunks
-        alpha_all = torch.zeros((world.shape[0],), device=dev)
+        alpha_all = torch.zeros((world.shape[0],), device=device)
         for s in range(0, norm.shape[0], chunk):
             e = min(s + chunk, norm.shape[0])
             sigma = self.feature2density(self.compute_density_patchwise_fast(norm[s:e], patch_coords[s:e]))
@@ -2913,8 +2893,8 @@ class TensorVMSplitPatch(TensorBase):
     
     def _rebuild_basis_like(self, old_linear, new_in_dim):
         out_dim = old_linear.out_features
-        dev = old_linear.weight.device
-        new_linear = torch.nn.Linear(new_in_dim, out_dim, bias=True).to(dev)
+        device = old_linear.weight.device
+        new_linear = torch.nn.Linear(new_in_dim, out_dim, bias=True).to(device)
         with torch.no_grad():
             k = min(new_in_dim, old_linear.in_features)
             new_linear.weight[:, :k].copy_(old_linear.weight[:, :k])
@@ -2944,11 +2924,48 @@ class TensorVMSplitPatch(TensorBase):
           by cloning the nearest existing patch (Chebyshev distance in base grid).
         - New patches start at depth=0 and keep current VM res (`self.gridSize`).
         """
-        dev = self.aabb.device
+        print(f"\n[ensure_min_coverage DEBUG]")
+        print(f"  patch_map keys: {list(self.patch_map.keys())}")
+        print(f"  aabb shape: {self.aabb.shape}")
+        print(f"  aabb values: {self.aabb}")
+
+        device = self.aabb.device
+
+        # 檢查 patch_map
+        if not self.patch_map:
+            print("[WARNING] patch_map is empty!")
+            return 0
+        
+        # 生成測試點
+        aabb = self.aabb.reshape(2, 3)
+        test_pts = torch.rand(seed_cells, 3, device=device)
+        test_pts = test_pts * (aabb[1] - aabb[0]) + aabb[0]
+        
+        print(f"  test_pts shape: {test_pts.shape}")
+        print(f"  test_pts range: min={test_pts.min(0).values}, max={test_pts.max(0).values}")
+        
+        # 嘗試映射 - 用 try-except 捕捉錯誤
+        try:
+            coords, exists = self._map_coords_to_patch_fast(test_pts)
+            print(f"  Mapping successful: exists={exists.sum()}/{exists.numel()}")
+        except RuntimeError as e:
+            print(f"[ERROR] _map_coords_to_patch_fast failed: {e}")
+            # 嘗試慢速版本
+            try:
+                coords, exists = self._map_coords_to_patch(test_pts)
+                print(f"  Slow version successful: exists={exists.sum()}/{exists.numel()}")
+            except RuntimeError as e2:
+                print(f"[ERROR] Both mapping functions failed: {e2}")
+                return 0
+        
+        miss_ratio = float((~exists).float().mean().item())
+        print(f"  miss_ratio: {miss_ratio}")
+
+
         self.ensure_default_patch()
 
         n = 8192
-        u = torch.rand((n,3), device=dev)
+        u = torch.rand((n,3), device=device)
         xyz = self.aabb[0] + (self.aabb[1]-self.aabb[0]) * u
 
         # Depth-aware existence check
@@ -2962,7 +2979,7 @@ class TensorVMSplitPatch(TensorBase):
         a0, a1 = self.aabb[0], self.aabb[1]
         extent = (a1 - a0).clamp_min(1e-8)
         p = (xyz - a0) / extent
-        baseG = torch.tensor(getattr(self, "base_patch_grid_reso", self._get_patch_grid_reso()), device=dev, dtype=torch.long)
+        baseG = torch.tensor(getattr(self, "base_patch_grid_reso", self._get_patch_grid_reso()), device=device, dtype=torch.long)
         kd0 = torch.floor(p * baseG.float()).long()
         kd0[...,0].clamp_(0, baseG[0]-1); kd0[...,1].clamp_(0, baseG[1]-1); kd0[...,2].clamp_(0, baseG[2]-1)
         kd0 = kd0[(~exists)]  # only for missing
@@ -2970,13 +2987,13 @@ class TensorVMSplitPatch(TensorBase):
         # Unique keys to add (cap by seed_cells)
         uniq = torch.unique(kd0, dim=0)
         if uniq.shape[0] > seed_cells:
-            perm = torch.randperm(uniq.shape[0], device=dev)[:seed_cells]
+            perm = torch.randperm(uniq.shape[0], device=device)[:seed_cells]
             uniq = uniq[perm]
 
         # Build a tensor of existing parent-level keys (depth-agnostic set of actual keys)
         cur_keys = torch.tensor(
             [k for k in self.patch_map.keys() if isinstance(k, tuple)], 
-            device=dev, dtype=torch.long
+            device=device, dtype=torch.long
         )
         added = 0
 
@@ -2985,7 +3002,7 @@ class TensorVMSplitPatch(TensorBase):
             uniq = uniq[:max(1, seed_cells)]
 
         for v in uniq.tolist():
-            v_t = torch.tensor(v, device=dev, dtype=torch.long) 
+            v_t = torch.tensor(v, device=device, dtype=torch.long) 
             key = tuple(int(x) for x in v)
             if key in self.patch_map:
                 continue
@@ -3012,7 +3029,7 @@ class TensorVMSplitPatch(TensorBase):
                 else:
                     # deep clone
                     def _clone_pl(pl):
-                        return torch.nn.ParameterList([torch.nn.Parameter(p.detach().clone().to(dev), requires_grad=True) for p in pl])
+                        return torch.nn.ParameterList([torch.nn.Parameter(p.detach().clone().to(device), requires_grad=True) for p in pl])
                     patch = {
                         'res': R[:],
                         'density_plane': _clone_pl(src["density_plane"]),
@@ -3026,10 +3043,10 @@ class TensorVMSplitPatch(TensorBase):
                         patch["basis_mat"] = self.get_shared_basis(in_f, out_f)
             else:
                 # very first seed
-                patch = self._create_patch(self.gridSize.tolist(), dev)
+                patch = self._create_patch(self.gridSize.tolist(), device)
 
             patch['depth'] = 0
-            self.patch_map[key] = self._ensure_patch_device(patch, dev)
+            self.patch_map[key] = self._ensure_patch_device(patch, device)
             added += 1
 
         # refresh helpers
@@ -3066,21 +3083,21 @@ class TensorVMSplitPatch(TensorBase):
         if key not in self.patch_map: 
             return False
         p = self.patch_map[key]
-        dev = self.aabb.device
+        device = self.aabb.device
         Csig = p['density_plane'][0].shape[1]
         Capp = p['app_plane'][0].shape[1]
 
         def _mk_planes_lines(C, R):
             Rx,Ry,Rz = R
             planes = torch.nn.ParameterList([
-                self._make_zero_param_like((1, C, Ry, Rz), dev),
-                self._make_zero_param_like((1, C, Rx, Rz), dev),
-                self._make_zero_param_like((1, C, Rx, Ry), dev),
+                self._make_zero_param_like((1, C, Ry, Rz), device),
+                self._make_zero_param_like((1, C, Rx, Rz), device),
+                self._make_zero_param_like((1, C, Rx, Ry), device),
             ])
             lines  = torch.nn.ParameterList([
-                self._make_zero_param_like((1, C, Rx, 1), dev),
-                self._make_zero_param_like((1, C, Ry, 1), dev),
-                self._make_zero_param_like((1, C, Rz, 1), dev),
+                self._make_zero_param_like((1, C, Rx, 1), device),
+                self._make_zero_param_like((1, C, Ry, 1), device),
+                self._make_zero_param_like((1, C, Rz, 1), device),
             ])
             return planes, lines
 
@@ -3574,8 +3591,8 @@ class TensorVMSplitPatch(TensorBase):
         """
         Quick global check: take n random samples to test whether exist visible alpha signal already.
         """
-        dev = self.aabb.device
-        u = torch.rand((n, 3), device=dev)
+        device = self.aabb.device
+        u = torch.rand((n, 3), device=device)
         xyz = self.aabb[0] + (self.aabb[1] - self.aabb[0]) * u
 
         xyz_norm = self.normalize_coord(xyz)
@@ -3595,9 +3612,9 @@ class TensorVMSplitPatch(TensorBase):
         Ouick random sample check: whether alpha quatile of one containing at least one patch is over threshold.
         Set a reasonable gate for staged alpha/shrink/prune to avoid process too early.
         """
-        dev = self.aabb.device
+        device = self.aabb.device
 
-        u = torch.rand((n, 3), device=dev)
+        u = torch.rand((n, 3), device=device)
         xyz = self.aabb[0] + (self.aabb[1] - self.aabb[0]) * u
         xyz_norm = self.normalize_coord(xyz)
         coords, exists = self._map_coords_to_patch_fast(xyz)
@@ -3705,7 +3722,7 @@ class TensorVMSplitPatch(TensorBase):
         - apply_gate: whether to apply the current alpha-gate (keeps consistency with training).
         - chunk: process in chunks to avoid OOM.
         """
-        dev = self.aabb.device
+        device = self.aabb.device
         aabb0, aabb1 = self.aabb[0], self.aabb[1]
 
         # precompute step & gate scale
@@ -3713,9 +3730,9 @@ class TensorVMSplitPatch(TensorBase):
         scale = float(self.alpha_gate_scale) if apply_gate else 1.0
 
         # prepare grid in world coords
-        xs = torch.linspace(0, 1, res, device=dev)
-        ys = torch.linspace(0, 1, res, device=dev)
-        zs = torch.linspace(0, 1, res, device=dev)
+        xs = torch.linspace(0, 1, res, device=device)
+        ys = torch.linspace(0, 1, res, device=device)
+        zs = torch.linspace(0, 1, res, device=device)
         X, Y, Z = torch.meshgrid(xs, ys, zs, indexing='ij')
         grid_coords = torch.stack([X, Y, Z], dim=-1).view(-1, 3)  # [res^3, 3] in [0,1]^3
         world_coords = aabb0 + (aabb1 - aabb0) * grid_coords
@@ -3728,7 +3745,7 @@ class TensorVMSplitPatch(TensorBase):
 
         # compute sigma in chunks (compute_density_patchwise_fast expects normalized coords)
         norm_coords = self.normalize_coord(world_coords)
-        out = torch.empty((world_coords.shape[0],), device=dev, dtype=torch.float32)
+        out = torch.empty((world_coords.shape[0],), device=device, dtype=torch.float32)
 
         for s in range(0, norm_coords.shape[0], chunk):
             e = min(s + chunk, norm_coords.shape[0])
@@ -4052,8 +4069,8 @@ class TensorVMSplitPatch(TensorBase):
         Ray marching over VM patches. Keeps a fallback patch so it won't crash
         when mapped coords miss current keys.
         """
-        dev = self.aabb.device
-        rays_chunk = rays_chunk.to(dev)
+        device = self.aabb.device
+        rays_chunk = rays_chunk.to(device)
         rays_o, viewdirs = rays_chunk[:, :3], rays_chunk[:, 3:6]
 
         xyz_sampled, z_vals, ray_valid = self.sample_ray(rays_o, viewdirs, is_train=is_train, N_samples=N_samples)
