@@ -1171,7 +1171,7 @@ class TensorVMSplitPatch(TensorBase):
         gz = self._gs1d_1CL1(lz, xyz[:, [2]])     # [N, Cz]
         
         sigma_feature = self.compute_densityfeature_patch(patch, xyz)  # [N, density_dim]
-        app_features = torch.cat([fx, fy, fz, gx, gy, gz], dim=1)  # [N, app_feat_dim]
+        app_features = torch.cat([fx, fy, fz, gx, gy, gz], dim=1)      # [N, app_feat_dim]
 
         # interior-gated residuals
         if bool(getattr(self, "enable_child_residual", True)):
@@ -1184,12 +1184,6 @@ class TensorVMSplitPatch(TensorBase):
 
         combined_feat = torch.cat([sigma_feature, app_features], dim=-1) 
         actual_dim = combined_feat.shape[1]
-
-        print(f"\n[compute_app_patch] Feature dimensions:")
-        print(f"  sigma_feature: {sigma_feature.shape}")
-        print(f"  app_features: {app_features.shape}") 
-        print(f"  combined_feat: {combined_feat.shape}")
-        print(f"  self.total_feat_dim: {self.total_feat_dim}")
 
         # 使用 SharedBasisManager 或傳統 basis_mat
         if hasattr(self, 'shared_basis_manager') and self.shared_basis_manager.mode == 'global':
