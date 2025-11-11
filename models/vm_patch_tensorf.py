@@ -210,8 +210,16 @@ class GlobalBasisWrapper(torch.nn.Module):
         self.in_features = in_dim
         self.out_features = manager.output_dim
         
-        # 獲取或創建係數層
         key_str = f"{patch_key[0]}_{patch_key[1]}_{patch_key[2]}"
+
+        # 檢查現有係數矩陣的維度是否匹配
+        if key_str in manager.patch_coeffs:
+            existing = manager.patch_coeffs[key_str]
+            if existing.in_features != in_dim:
+                # 維度不匹配，刪除舊的
+                del manager.patch_coeffs[key_str]
+        
+        # 創建或使用現有的係數層
         if key_str not in manager.patch_coeffs:
             coeffs = torch.nn.Linear(in_dim, manager.n_basis, bias=False, device=manager.device, dtype=manager.dtype)
             torch.nn.init.xavier_uniform_(coeffs.weight, gain=0.1)
@@ -366,11 +374,8 @@ class TensorVMSplitPatch(TensorBase):
             
         Gx, Gy, Gz = self._get_patch_grid_reso()
         
-        # 建立查詢表：-1 表示沒有 patch
-        self.patch_lookup = torch.full((Gx, Gy, Gz), -1, 
-                                    dtype=torch.long, device=self.device)
-        
-        # 建立索引到 key 的映射
+        # 建立查詢表：-1 表示grid cell沒有對應的patch
+        self.patch_lookup = torch.full((Gx, Gy, Gz), -1, dtype=torch.long, device=self.aabb.device)
         self.patch_idx_to_key = {}
         
         for idx, key in enumerate(self.patch_map.keys()):
@@ -380,6 +385,7 @@ class TensorVMSplitPatch(TensorBase):
                 self.patch_idx_to_key[idx] = key
         
         self._lookup_table_valid = True
+        print(f"[build_patch_lookup_table] Built lookup for G=({Gx},{Gy},{Gz}), {len(self.patch_map)} patches")
 
     @torch.no_grad()
     def _map_coords_to_patch_fast(self, xyz_coords):
@@ -388,7 +394,7 @@ class TensorVMSplitPatch(TensorBase):
         """
         if not hasattr(self, '_lookup_table_valid') or not self._lookup_table_valid:
             self.build_patch_lookup_table()
-        
+
         device = xyz_coords.device
         
         aabb = self.aabb
@@ -405,6 +411,11 @@ class TensorVMSplitPatch(TensorBase):
         Gx, Gy, Gz = self._get_patch_grid_reso()
         G_t = torch.tensor([Gx, Gy, Gz], device=device, dtype=torch.float32)
         
+        if self.patch_lookup.shape != (Gx, Gy, Gz):
+            print(f"[WARN] patch_lookup shape mismatch: {self.patch_lookup.shape} vs ({Gx},{Gy},{Gz})")
+            print(f"       Rebuilding lookup table...")
+            self.build_patch_lookup_table()
+
         eps = 1e-6
         p = ((xyz_coords - a0) / extent).clamp(0.0, 1.0 - eps)
         idx = torch.floor(p * G_t).long()
@@ -416,6 +427,12 @@ class TensorVMSplitPatch(TensorBase):
         flat_shape = idx.shape[:-1]
         idx_flat = idx.view(-1, 3)
         
+        if (idx_flat[:, 0] >= Gx).any() or (idx_flat[:, 1] >= Gy).any() or (idx_flat[:, 2] >= Gz).any():
+            print(f"[ERROR] Index still out of bounds after clamp!")
+            print(f"  idx_flat.max: {idx_flat.max(dim=0).values.tolist()}")
+            print(f"  G: ({Gx}, {Gy}, {Gz})")
+            idx_flat = torch.clamp(idx_flat, 0, torch.tensor([Gx-1, Gy-1, Gz-1], device=device))
+
         patch_indices = self.patch_lookup[idx_flat[:, 0], idx_flat[:, 1], idx_flat[:, 2]]
         exists_flat = (patch_indices >= 0)
         
@@ -431,14 +448,12 @@ class TensorVMSplitPatch(TensorBase):
         """
         device = xyz_coords.device
 
-        # --- AABB to (2,3) ---
         aabb = self.aabb
         if aabb.numel() == 6:
             aabb = aabb.reshape(2, 3)
         a0, a1 = aabb[0], aabb[1]
         extent = (a1 - a0).clamp_min(1e-8)
 
-        # empty map
         if not self.patch_map:
             coords = torch.zeros((*xyz_coords.shape[:-1], 3), dtype=torch.long, device=device)
             exists = torch.zeros((*xyz_coords.shape[:-1],), dtype=torch.bool, device=device)
@@ -447,28 +462,39 @@ class TensorVMSplitPatch(TensorBase):
                 return coords, exists, snapped
             return coords, exists
 
-        # ---- 推回當前 G ----
+        # 推回當前 G
         keys_t = torch.as_tensor(list(self.patch_map.keys()), device=device, dtype=torch.long)  # [K,3]
         G_t = keys_t.max(dim=0).values + 1            # tensor [3]，用來做計算/廣播
         G = tuple(int(v) for v in G_t.tolist())       # ints，用來建 tensor shape / 索引
 
+        if (keys_t < 0).any():
+            print(f"[ERROR] Negative patch keys detected: {keys_t[keys_t < 0].tolist()}")
+            keys_t = keys_t.clamp(min=0)
+
         # 佔據表（用 ints 建 shape）
         occ = torch.zeros(G, dtype=torch.bool, device=device)
+
+        max_allowed = torch.tensor([G[0]-1, G[1]-1, G[2]-1], device=device)
+        if (keys_t > max_allowed.unsqueeze(0)).any():
+            print(f"[ERROR] keys_t exceeds G bounds!")
+            print(f"  Offending keys: {keys_t[(keys_t > max_allowed.unsqueeze(0)).any(dim=1)].tolist()}")
+            keys_t = torch.minimum(keys_t, max_allowed.unsqueeze(0))
+
         occ[keys_t[:, 0], keys_t[:, 1], keys_t[:, 2]] = True
 
-        # ---- 正規化 -> 量化到 cell ----
+        # 正規化 -> 量化到 cell
         eps = 1e-6
         p = ((xyz_coords - a0) / extent).clamp(0.0, 1.0 - eps)          # [...,3] in [0,1)
         idx = torch.floor(p * G_t.to(p.dtype)).long()                   # [...,3]
         hi = (G_t - 1).view(*([1] * (idx.dim() - 1)), 3)                # [...,3]
         lo = torch.zeros_like(hi)
-        idx = torch.minimum(torch.maximum(idx, lo), hi)                 # clamp 到 [0, G-1]
+        idx = torch.minimum(torch.maximum(idx, lo), hi)                 # [0, G-1]
 
         exists = occ[idx[..., 0], idx[..., 1], idx[..., 2]]
         coords_out = idx.clone()
         snapped = torch.zeros_like(exists, dtype=torch.bool)
 
-        # ---- 鄰域 snap（半徑=1；若想支援非 adjacent-only，可把半徑調 2）----
+        # 鄰域 snap（半徑=1；若想支援非 adjacent-only，可把半徑調 2）
         if snap_missing:
             # 攤平成 1D 處理（避免多維 nonzero/squeeze 陷阱）
             sh = idx.shape[:-1]
@@ -503,7 +529,7 @@ class TensorVMSplitPatch(TensorBase):
                 hit_any = occ_nei.any(dim=1) & ok_tau
 
                 if hit_any.any():
-                    # 先用「第一個命中」；你要最近中心也行
+                    # 先用「第一個命中」；最近中心也行
                     first = occ_nei[hit_any].float().argmax(dim=1)         # [H]
                     chosen = nei[hit_any, first, :]                        # [H,3]
                     coords_flat[miss[hit_any]] = chosen
@@ -672,6 +698,11 @@ class TensorVMSplitPatch(TensorBase):
         self.patch_grid_reso = (int(size[0]), int(size[1]), int(size[2]))
         self.base_patch_grid_reso = self.patch_grid_reso
         self.current_patch_keys = sorted(list(new_map.keys()))
+
+        if hasattr(self, '_lookup_table_valid'):
+            self._lookup_table_valid = False
+        if hasattr(self, 'build_patch_lookup_table'):
+            self.build_patch_lookup_table()
 
     def ensure_default_patch(self):
         """
@@ -919,6 +950,11 @@ class TensorVMSplitPatch(TensorBase):
         self.patch_grid_reso = (Gx, Gy, Gz)
         self.assert_zero_origin_and_contiguous()
 
+        if hasattr(self, '_lookup_table_valid'):
+            self._lookup_table_valid = False
+        if hasattr(self, 'build_patch_lookup_table'):
+            self.build_patch_lookup_table()
+
     def _as_NC(self, t: torch.Tensor, N_expected: int) -> torch.Tensor:
         """
         Convert input to [N, C].
@@ -1134,12 +1170,7 @@ class TensorVMSplitPatch(TensorBase):
         gy = self._gs1d_1CL1(ly, xyz[:, [1]])     # [N, Cy]
         gz = self._gs1d_1CL1(lz, xyz[:, [2]])     # [N, Cz]
         
-        app_feat = torch.cat([fx, fy, fz, gx, gy, gz], dim=1)  # [N, app_feat_dim]
-        
-        if 'basis_mat' in patch:
-            print(f"  basis_mat type: {type(patch['basis_mat'])}")
-            if hasattr(patch['basis_mat'], 'in_features'):
-                print(f"  basis_mat.in_features: {patch['basis_mat'].in_features}")
+        app_feat = torch.cat([fx*gx, fy*gy, fz*gz], dim=1)  # [N, app_feat_dim]  
 
         # interior-gated residuals
         if bool(getattr(self, "enable_child_residual", True)):
@@ -1151,15 +1182,6 @@ class TensorVMSplitPatch(TensorBase):
                 app_feat = app_feat + g * rfeat
 
         actual_dim = app_feat.shape[1]
-
-        print(f"\n[compute_app_patch DEBUG]")
-        print(f"  fx.shape: {fx.shape}")
-        print(f"  fy.shape: {fy.shape}")
-        print(f"  fz.shape: {fz.shape}")
-        print(f"  gx.shape: {gx.shape}")
-        print(f"  gy.shape: {gy.shape}")
-        print(f"  gz.shape: {gz.shape}")
-        print(f"  app_features.shape: {app_feat.shape}")
 
         # 使用 SharedBasisManager 或傳統 basis_mat
         if hasattr(self, 'shared_basis_manager') and self.shared_basis_manager.mode == 'global':
@@ -1504,6 +1526,15 @@ class TensorVMSplitPatch(TensorBase):
             self.assert_zero_origin_and_contiguous()
         except Exception as e:
             print(f"[WARN] assert_zero_origin_and_contiguous failed: {e}")
+
+        if hasattr(self, '_lookup_table_valid'):
+            self._lookup_table_valid = False  # 標記為無效，強制重建
+        if hasattr(self, 'build_patch_lookup_table'):
+            try:
+                self.build_patch_lookup_table()
+                print(f"[strict_evenize] Rebuilt patch_lookup_table for G={self.patch_grid_reso}")
+            except Exception as e:
+                print(f"[WARN] Failed to rebuild lookup table: {e}")
 
     def _resolve_caps(self, args):
         cap_single = getattr(args, "max_rank", None)              # int or None
@@ -2909,6 +2940,12 @@ class TensorVMSplitPatch(TensorBase):
         ks = torch.tensor(list(patch_map.keys()), dtype=torch.long)  # [N,3]
         mink, maxk = ks.min(0).values, ks.max(0).values
         G = (maxk - mink + 1).tolist()
+
+        if hasattr(self, '_lookup_table_valid'):
+            self._lookup_table_valid = False
+        if hasattr(self, 'build_patch_lookup_table'):
+            self.build_patch_lookup_table()
+
         return [int(g) for g in G]
 
     def ensure_min_coverage(self, target_miss=0.10, seed_cells=6):
@@ -2960,7 +2997,6 @@ class TensorVMSplitPatch(TensorBase):
         
         miss_ratio = float((~exists).float().mean().item())
         print(f"  miss_ratio: {miss_ratio}")
-
 
         self.ensure_default_patch()
 
@@ -3049,10 +3085,14 @@ class TensorVMSplitPatch(TensorBase):
             self.patch_map[key] = self._ensure_patch_device(patch, device)
             added += 1
 
-        # refresh helpers
         if hasattr(self, "infer_patch_grid_reso_from_keys"):
             self.patch_grid_reso = tuple(self.infer_patch_grid_reso_from_keys(self.patch_map))
         self.current_patch_keys = list(self.patch_map.keys())
+
+        if hasattr(self, '_lookup_table_valid'):
+            self._lookup_table_valid = False
+        if hasattr(self, 'build_patch_lookup_table'):
+            self.build_patch_lookup_table()
 
         return added
 
@@ -3467,6 +3507,11 @@ class TensorVMSplitPatch(TensorBase):
             gs = list(self.gridSize)
         self.update_stepSize(gs)
 
+        if hasattr(self, '_lookup_table_valid'):
+            self._lookup_table_valid = False
+        if hasattr(self, 'build_patch_lookup_table'):
+            self.build_patch_lookup_table()
+
         print(f"[shrink] removed {removed} patches; new AABB = {self.aabb.tolist()}")
     
     @torch.no_grad()
@@ -3558,6 +3603,11 @@ class TensorVMSplitPatch(TensorBase):
                 P['res'] = [int(newRx), int(newRy), int(newRz)]
                 n_cropped += 1
 
+        if hasattr(self, '_lookup_table_valid'):
+            self._lookup_table_valid = False
+        if hasattr(self, 'build_patch_lookup_table'):
+            self.build_patch_lookup_table()
+
         return n_cropped
 
     @torch.no_grad()
@@ -3646,6 +3696,11 @@ class TensorVMSplitPatch(TensorBase):
             if float(qv.item()) >= min_val:
                 confident = True
                 break
+        
+        if hasattr(self, '_lookup_table_valid'):
+            self._lookup_table_valid = False
+        if hasattr(self, 'build_patch_lookup_table'):
+            self.build_patch_lookup_table()
 
         return confident
 
@@ -3861,6 +3916,10 @@ class TensorVMSplitPatch(TensorBase):
             if hasattr(self, "assert_zero_origin_and_contiguous"):
                 try: self.assert_zero_origin_and_contiguous()
                 except Exception as e: print(f"[WARN] assert_zero_origin_and_contiguous failed: {e}")
+            if hasattr(self, '_lookup_table_valid'):
+                self._lookup_table_valid = False
+            if hasattr(self, 'build_patch_lookup_table'):
+                self.build_patch_lookup_table()
 
         elif "state_dict" in ckpt:
             self.load_state_dict(ckpt["state_dict"], strict=False)
