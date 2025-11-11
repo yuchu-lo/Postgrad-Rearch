@@ -2428,7 +2428,7 @@ class TensorVMSplitPatch(TensorBase):
 
             if "basis_mat" in patch:
                 new_in = self._app_in_dim_from_vm(a_plane_up, a_line_up)
-                new_patch["basis_mat"] = self.get_shared_basis(new_in, self.app_dim)
+                new_patch["basis_mat"] = self.get_shared_basis(key, new_in)
             
             new_map[key] = self._ensure_patch_device(new_patch, device)
 
@@ -2546,15 +2546,15 @@ class TensorVMSplitPatch(TensorBase):
                         child['basis_mat'] = parent_patch['basis_mat']
                     else:
                         in_f = self._app_in_dim_from_vm(child['app_plane'], child['app_line'])
-                        child['basis_mat'] = self.get_shared_basis(in_f, self.app_dim)
+                        child['basis_mat'] = self.get_shared_basis(new_key, in_f)
 
                     children[new_key] = child
 
         return children
 
     @torch.no_grad()
-    def _resize_patch_to_res(self, patch: dict, res_new: tuple, *,
-                             mode: str = "bilinear", align_corners: bool = False) -> dict:
+    def _resize_patch_to_res(self, patch: dict, patch_key: tuple, res_new: tuple, *,
+                             mode: str = "bilinear", align_corners: bool = False) -> dict: 
         """
         把單一 patch 的 density/app planes+lines 重新取樣到 res_new=(Rx,Ry,Rz)。
         會同步更新 patch['res']、並確保 basis_mat.in_features 正確。
@@ -2598,22 +2598,20 @@ class TensorVMSplitPatch(TensorBase):
         new_patch['app_line']      = alines_new
         new_patch['res']           = [Rx, Ry, Rz]
 
-        # ---- basis_mat in_features 修正 ----
+        # basis_mat in_features 修正 
         if 'basis_mat' in patch and hasattr(self, '_app_in_dim_from_vm'):
             new_in = self._app_in_dim_from_vm(aplanes_new, alines_new)
             old_lin = patch['basis_mat']
             if getattr(old_lin, 'in_features', None) != new_in:
                 if hasattr(self, '_rebuild_basis_like'):
-                    new_patch['basis_mat'] = self.get_shared_basis(new_in, self.app_dim)
+                    new_patch['basis_mat'] = self.get_shared_basis(patch_key, new_in)
                 else:
-                    out_dim = self.app_dim
-                    new_lin = self.get_shared_basis(new_in, out_dim)
+                    new_lin = self.get_shared_basis(patch_key, new_in)
                     new_patch['basis_mat'] = new_lin
         else:
             if hasattr(self, '_app_in_dim_from_vm'):
                 new_in = self._app_in_dim_from_vm(aplanes_new, alines_new)
-                out_dim = self.app_dim
-                new_lin = self.get_shared_basis(new_in, out_dim)
+                new_lin = self.get_shared_basis(patch_key, new_in)
                 new_patch['basis_mat'] = new_lin
 
         return new_patch
@@ -2639,7 +2637,7 @@ class TensorVMSplitPatch(TensorBase):
         keyset = set([tuple(map(int, k)) for k in keys])
         for k, p in self.patch_map.items():
             if tuple(k) in keyset:
-                new_map[k] = self._resize_patch_to_res(p, tuple(res_new), mode=mode, align_corners=align_corners)
+                new_map[k] = self._resize_patch_to_res(p, k, tuple(res_new), mode=mode, align_corners=align_corners)
                 cnt += 1
             else:
                 new_map[k] = p  # untouched
@@ -3056,7 +3054,7 @@ class TensorVMSplitPatch(TensorBase):
                     }
                     if "basis_mat" in src:
                         new_in = self._app_in_dim_from_vm(patch["app_plane"], patch["app_line"])
-                        patch["basis_mat"] = self.get_shared_basis(new_in, self.app_dim)
+                        patch["basis_mat"] = self.get_shared_basis(key, new_in)
                 else:
                     # deep clone
                     def _clone_pl(pl):
@@ -3070,8 +3068,7 @@ class TensorVMSplitPatch(TensorBase):
                     }
                     if "basis_mat" in src:
                         in_f  = int(src["basis_mat"].in_features)
-                        out_f = int(src["basis_mat"].out_features)
-                        patch["basis_mat"] = self.get_shared_basis(in_f, out_f)
+                        patch["basis_mat"] = self.get_shared_basis(key, in_f)
             else:
                 # very first seed
                 patch = self._create_patch(self.gridSize.tolist(), device)
@@ -3898,7 +3895,7 @@ class TensorVMSplitPatch(TensorBase):
                     key = eval(k_str) if isinstance(k_str, str) else tuple(k_str)
                 except Exception:
                     key = tuple(int(x) for x in str(k_str).replace("(", "").replace(")", "").split(",") if x != "")
-                pm[key] = self._deserialize_patch(P, device)
+                pm[key] = self._deserialize_patch(P, key, device)
 
             self.patch_map = pm
             self.current_patch_keys = list(self.patch_map.keys())
@@ -3958,7 +3955,13 @@ class TensorVMSplitPatch(TensorBase):
         body = ", ".join(f"{k}:{v}" for k, v in sorted(cnt.items(), key=lambda x: x[0]))
         print(f"{header} {body if body else '(no hits)'}")
 
-    def _deserialize_patch(self, P, device):
+    def _deserialize_patch(self, P, patch_key, device):
+        """
+        Args:
+            P: 序列化的 patch 數據
+            patch_key: patch 的 key tuple (i,j,k)
+            device: 目標設備
+        """
         R = list(P["res"])
         new_patch = self._create_patch(R, device)
 
@@ -3971,25 +3974,8 @@ class TensorVMSplitPatch(TensorBase):
         _copy(new_patch["app_plane"],     P["app_plane"])
         _copy(new_patch["app_line"],      P["app_line"])
 
-        # 修改這部分：不再直接創建 Linear，而是從 SharedBasisManager 獲取
-        if "basis_w" in P:  # 舊版相容性
-            in_dim  = P["basis_w"].shape[1]
-            out_dim = int(P.get("app_dim", P["basis_w"].shape[0]))
-        else:
-            in_dim = self._app_in_dim_from_vm(new_patch["app_plane"], new_patch["app_line"])
-            out_dim = self.app_dim
-        
-        # 從 SharedBasisManager 獲取
-        new_patch["basis_mat"] = self.get_shared_basis(in_dim, out_dim)
-        
-        # 如果有舊的權重，嘗試複製（但這可能會覆蓋共享的權重）
-        if "basis_w" in P:
-            with torch.no_grad():
-                W = P["basis_w"].to(device)
-                if tuple(W.shape) == tuple(new_patch["basis_mat"].weight.shape):
-                    new_patch["basis_mat"].weight.copy_(W)
-                else:
-                    print(f"[WARN] basis weight shape mismatch, skip copy")
+        in_dim = self._app_in_dim_from_vm(new_patch["app_plane"], new_patch["app_line"])
+        new_patch["basis_mat"] = self.get_shared_basis(patch_key, in_dim)
         
         new_patch["res"] = R
         return new_patch
@@ -4064,6 +4050,7 @@ class TensorVMSplitPatch(TensorBase):
         new_map = {}
         for pid in keys_by_patch.keys():
             pi, pj, pk = map(int, pid.split("_"))
+            patch_key = (pi, pj, pk)
 
             res_t = patch_state[f"{pid}.res"]
             res = res_t.tolist() if hasattr(res_t, "tolist") else list(res_t)
@@ -4081,9 +4068,8 @@ class TensorVMSplitPatch(TensorBase):
                 out_dim = int(patch_state[f"{pid}.basis_mat.out"])
             else:
                 in_dim  = self._app_in_dim_from_vm(apl, aln)
-                out_dim = getattr(self, "app_dim", 27)
 
-            bm = self.get_shared_basis(in_dim, out_dim)
+            bm = self.get_shared_basis(patch_key, in_dim)
 
             if f"{pid}.basis_mat.weight" in patch_state:
                 print(f"[WARN] Found basis_mat.weight for patch {pid}, "
