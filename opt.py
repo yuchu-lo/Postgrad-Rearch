@@ -72,13 +72,20 @@ def config_parser(cmd=None):
     parser.add_argument('--rm_weight_mask_thre', type=float, default=0.0,
                         help='remove ray mask threshold (<=0 to disable)')
     
-    # —— Shared basis —— 
-    parser.add_argument('--global_basis_enable', type=int, default=1,
-                    help='Enable global shared basis for VM decomposition (1=enabled, 0=use old method)')
+    # ===== Global shared basis ===== 
+    parser.add_argument('--basis_mode', type=str, default='global', 
+                        choices=['global', 'shared', 'hybrid'],
+                        help='basis sharing mode')
+    parser.add_argument('--use_shared_basis', type=_parse_bool, default=True,
+                        help='whether to use shared basis mechanism')
+    parser.add_argument('--n_basis', type=int, default=128,
+                        help='number of basis vectors in the shared basis')
+    parser.add_argument('--global_basis_enable', type=_parse_bool, default=True,
+                        help='enable global shared basis for VM decomposition')
     parser.add_argument('--global_basis_k_sigma', type=int, default=64,
-                        help='Number of global basis vectors for density (higher=more expressive but more memory)')
+                        help='number of global basis vectors for density (higher=more expressive but more memory)')
     parser.add_argument('--global_basis_k_app', type=int, default=96,
-                        help='Number of global basis vectors for appearance')
+                        help='number of global basis vectors for appearance')
 
     # ===== Patch Continuity / Residual & Seam (Model toggles) =====
     parser.add_argument('--enable_child_residual', type=_parse_bool, default=True,
@@ -338,12 +345,12 @@ def config_parser(cmd=None):
                         help='iterations to keep the LR boost active for new child params (will decay back to base)')
 
     # —— Strict-even split —— 
-    parser.add_argument('--strict_even_split', action='store_true',
-                        help='enable strict even split (G -> n^3)')
-    parser.add_argument('--strict_even_n', type=int, default=3,
-                        help='target n for strict-even split')
-    parser.add_argument('--skip_strict_even', action='store_true',
-                        help='skip strict-even split')
+    parser.add_argument('--strict_even_kick', type=int, default=1500, 
+                        help='first strict-even split (patch-level split) iteration')
+    parser.add_argument('--strict_even_warmup_iters', type=int, default=300,  
+                        help='lr warmup steps right after strict-even split')
+    parser.add_argument('--strict_even_target_G', type=int, nargs='*', default=[3, 3, 3], 
+                        help='grid G after first strict-even split')
     
     # —— Splitting to be uneven —— 
     parser.add_argument('--split_boost_enable', type=_parse_bool, default=False,
@@ -374,12 +381,6 @@ def config_parser(cmd=None):
                         help='hard cap model size at even-to-uniform stage')
     
     # —— Selective-even split —— 
-    parser.add_argument('--strict_even_kick', type=int, default=1500, 
-                        help='first strict-even split (patch-level split) iteration')
-    parser.add_argument('--strict_even_warmup_iters', type=int, default=300,  
-                        help='lr warmup steps right after strict-even split')
-    parser.add_argument('--strict_even_target_G', type=int, nargs='*', default=[3, 3, 3], 
-                        help='grid G after first strict-even split')
     parser.add_argument('--split_even_kicks', type=int, nargs='*', 
                         default=[2200, 3600, 8000, 15000, 22000, 30000, 38000],
                         help='schedule of subsequent selective-even split events')
@@ -473,6 +474,10 @@ def config_parser(cmd=None):
     # === Split schedule warmup ===
     parser.add_argument('--split_warmup_iters', type=int, default=15000,
                         help='disable split events before this iter (only-UPS first)')
+    parser.add_argument('--split_min_vm_res', type=int, default=16,
+                        help='minimum VM resolution required before allowing patch splits (per-axis min)')
+    parser.add_argument('--split_min_feat_dim', type=int, default=64,
+                        help='minimum app feature dimension (sum of app_n_comp) required for splits')
 
     # === Shared basis + per-patch mixing ===
     parser.add_argument('--basis_rank', type=int, default=16,

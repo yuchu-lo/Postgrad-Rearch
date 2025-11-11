@@ -73,10 +73,10 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
     print("[uneven_critrn] Applying criterion ...")
 
     # ----------------- hyperparams & knobs -----------------
-    lam      = float(args.critrn_lambda)             # λ for memory
-    tau      = float(args.logmargin_tau)             # acceptance threshold on log-margin
-    acc_r    = float(args.critrn_accept_ratio)       # fraction of views that must accept
-    frac     = float(args.critrn_refine_frac)        # final refine fraction among candidates
+    lam   = float(args.critrn_lambda)        # λ for memory
+    tau   = float(args.logmargin_tau)        # acceptance threshold on log-margin
+    acc_r = float(args.critrn_accept_ratio)  # fraction of views that must accept
+    frac  = float(args.critrn_refine_frac)   # final refine fraction among candidates
 
     focus_start      = int(getattr(args, "critrn_focus_start", 8000))
     halo_cheby       = int(getattr(args, "critrn_focus_halo", 1))
@@ -86,8 +86,8 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
     sample_per_view  = int(getattr(args, "critrn_sample_rays", 2048))
 
     # boundary cost controls (safe defaults keep behavior similar if unset)
-    alpha_boundary        = float(getattr(args, "puf_alpha_boundary", 0.3))  # 0.0 = disabled
-    bcost_mode            = str(getattr(args, "boundary_cost_mode", "dof"))  # "dof" (current)
+    alpha_boundary        = float(getattr(args, "puf_alpha_boundary", 0.3))        # 0.0 = disabled
+    bcost_mode            = str(getattr(args, "boundary_cost_mode", "dof"))        # "dof" (current)
     bcost_smooth_strength = float(getattr(args, "boundary_smooth_strength", 1.0))  # scale on (1 - roughness)
     # ------------------------------------------------------------------------
 
