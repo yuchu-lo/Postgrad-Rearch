@@ -2961,11 +2961,6 @@ class TensorVMSplitPatch(TensorBase):
           by cloning the nearest existing patch (Chebyshev distance in base grid).
         - New patches start at depth=0 and keep current VM res (`self.gridSize`).
         """
-        print(f"\n[ensure_min_coverage DEBUG]")
-        print(f"  patch_map keys: {list(self.patch_map.keys())}")
-        print(f"  aabb shape: {self.aabb.shape}")
-        print(f"  aabb values: {self.aabb}")
-
         device = self.aabb.device
 
         # 檢查 patch_map
