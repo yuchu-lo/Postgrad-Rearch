@@ -876,6 +876,11 @@ def uneven_critrn(test_dataset, tensorf, res_target, args, renderer, step, devic
         except Exception as e:
             print(f"[WARN] assert_zero_origin_and_contiguous failed: {e}")
 
+    if hasattr(tensorf, '_lookup_table_valid'):
+        tensorf._lookup_table_valid = False
+    if hasattr(tensorf, 'build_patch_lookup_table'):
+        tensorf.build_patch_lookup_table()
+
     if len(to_split) > 0:
         depth_stats = {}
         for key, patch in tensorf.patch_map.items():
