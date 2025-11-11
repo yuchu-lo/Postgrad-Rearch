@@ -133,7 +133,7 @@ class SharedBasisManager(torch.nn.Module):
             # 分析所有係數，找出不常用的基底
             importance = torch.zeros(self.n_basis, device=self.device)
             for coeffs in self.patch_coeffs.values():
-                importance += coeffs.weight.abs().sum(dim=0)
+                importance += coeffs.weight.abs().sum(dim=1)
             
             # 保留重要的基底
             keep_mask = importance > threshold
@@ -268,7 +268,7 @@ class TensorVMSplitPatch(TensorBase):
         basis_mode                = kargs.pop("basis_mode", "global")  # 'global', 'shared', 'hybrid'
         self.n_basis              = int(kargs.pop("n_basis", 128))
         self.use_shared_basis     = bool(kargs.pop("use_shared_basis", True))
-        self.global_basis_enable  = bool(kargs.pop("global_basis_enable", False))
+        self.global_basis_enable  = bool(kargs.pop("global_basis_enable", True))
         self.global_basis_k_sigma = int(kargs.pop("global_basis_k_sigma", 64))
         self.global_basis_k_app   = int(kargs.pop("global_basis_k_app", 96))
 
