@@ -11,51 +11,61 @@ from contextlib import contextmanager
 from typing import Optional, Sequence, List, Tuple, Dict, Any
 
 class SharedBasisManager(torch.nn.Module):
-    def __init__(self, mode='global', n_basis=128, app_dim=27, 
+    def __init__(self, mode='global', n_basis=128, 
+                 input_dim=None, output_dim=27, 
                  device='cuda', dtype=torch.float32, 
                  sparsity_reg=0.01, adaptive=True):
         super().__init__()
         self.mode = mode  # 'global', 'shared', 'hybrid'
         self.n_basis = n_basis
-        self.app_dim = app_dim
+        self.input_dim = input_dim
+        self.output_dim = output_dim
         self.device = device if isinstance(device, torch.device) else torch.device(device)
         self.dtype = dtype
         self.sparsity_reg = sparsity_reg
         self.adaptive = adaptive
         
         if mode == 'global':
-            # 全域共享基底（方案 A）
-            self.global_basis = torch.nn.Linear(n_basis, app_dim, bias=False, device=self.device, dtype=self.dtype)
+            # 全域共享基底
+            # Linear: input_dim -> n_basis
+            # basis: n_basis -> output_dim
+            self.global_basis = torch.nn.Linear(n_basis, output_dim, bias=False, device=self.device, dtype=self.dtype)
             torch.nn.init.orthogonal_(self.global_basis.weight)
             self.patch_coeffs = torch.nn.ModuleDict()
             
         elif mode == 'shared':
-            # 維度共享（方案 B）
+            # 維度共享
             self._basis_bank = torch.nn.ModuleDict()
             self._basis_registry = {}
             
         elif mode == 'hybrid':
             # 混合模式：小 patches 用全域，大 patches 用獨立
-            self.global_basis = torch.nn.Linear(n_basis, app_dim, bias=False, device=self.device, dtype=self.dtype)
+            self.global_basis = torch.nn.Linear(n_basis, output_dim, bias=False, device=self.device, dtype=self.dtype)
             torch.nn.init.orthogonal_(self.global_basis.weight)
             self.patch_coeffs = torch.nn.ModuleDict()
             self._basis_bank = torch.nn.ModuleDict()
     
-    def get_or_create_basis(self, patch_key, in_dim, patch_info=None):
+    def get_or_create_basis(self, patch_key, in_dim=None, patch_info=None):
         """
         統一介面，根據模式返回適當的 basis
-        patch_info 可包含：res, importance, depth 等
+        Args:
+            patch_key: patch 識別碼 (tuple)
+            in_dim: 輸入維度，如果為 None 則使用 self.input_dim
+            patch_info: 可包含 res, importance, depth 等
         """
+        if in_dim is None:
+            in_dim = self.input_dim
+
         if self.mode == 'global':
             return GlobalBasisWrapper(self, patch_key, in_dim)
         elif self.mode == 'shared':
-            return self._get_shared_basis(in_dim, self.app_dim)
+            return self._get_shared_basis(in_dim, self.output_dim)
         elif self.mode == 'hybrid':
             # 根據 patch 特性決定
             if patch_info and min(patch_info.get('res', [32,32,32])) < 32:
                 return GlobalBasisWrapper(self, patch_key, in_dim)
             else:
-                return self._get_shared_basis(in_dim, self.app_dim)
+                return self._get_shared_basis(in_dim, self.output_dim)
     
     def _get_shared_basis(self, in_dim, out_dim):
         """內部方法：獲取或創建共享的 basis（用於 shared 和 hybrid 模式）"""
@@ -64,8 +74,8 @@ class SharedBasisManager(torch.nn.Module):
         if key not in self._basis_registry:
             # 創建新的共享 basis
             bank_id = f"basis_{in_dim}_{out_dim}_{len(self._basis_bank)}"
-            basis = torch.nn.Linear(in_dim, out_dim, bias=False, 
-                                   device=self.device, dtype=self.dtype)
+            basis = torch.nn.Linear(in_dim, out_dim, bias=False, device=self.device, dtype=self.dtype)
+            torch.nn.init.orthogonal_(basis.weight)
             self._basis_bank[bank_id] = basis
             self._basis_registry[key] = bank_id
         
@@ -132,7 +142,7 @@ class SharedBasisManager(torch.nn.Module):
             if len(keep_indices) < self.n_basis:
                 # 創建新的縮減基底
                 new_n_basis = len(keep_indices)
-                new_basis = torch.nn.Linear(new_n_basis, self.app_dim, bias=False)
+                new_basis = torch.nn.Linear(new_n_basis, self.output_dim, bias=False)
                 new_basis.weight.data = self.global_basis.weight[:, keep_indices]
                 
                 # 更新所有係數矩陣
@@ -197,12 +207,12 @@ class GlobalBasisWrapper(torch.nn.Module):
         self.manager = manager
         self.patch_key = patch_key
         self.in_features = in_dim
-        self.out_features = manager.app_dim
+        self.out_features = manager.output_dim
         
         # 獲取或創建係數層
         key_str = f"{patch_key[0]}_{patch_key[1]}_{patch_key[2]}"
         if key_str not in manager.patch_coeffs:
-            coeffs = torch.nn.Linear(in_dim, manager.n_basis, bias=False, device=manager.device, dtype=manager.dtype )
+            coeffs = torch.nn.Linear(in_dim, manager.n_basis, bias=False, device=manager.device, dtype=manager.dtype)
             torch.nn.init.xavier_uniform_(coeffs.weight, gain=0.1)
             manager.patch_coeffs[key_str] = coeffs
         self.coeffs = manager.patch_coeffs[key_str]
@@ -265,7 +275,6 @@ class TensorVMSplitPatch(TensorBase):
 
         self.repair_enable           = bool(kargs.pop("repair_enable", True))
         self.repair_tau              = float(kargs.pop("repair_tau", 1.0))
-        self.repair_adjacent_only    = bool(kargs.pop("repair_adjacent_only", True))
         self.repair_grad_scale_sigma = float(kargs.pop("repair_grad_scale_sigma", 0.0)) 
         self.repair_grad_scale_app   = float(kargs.pop("repair_grad_scale_app", 0.3))
 
@@ -278,16 +287,22 @@ class TensorVMSplitPatch(TensorBase):
         self._last_rank_resize_iter = None
         
         super().__init__(aabb, gridSize, device, **kargs)
-        
+
         self._seam_banks = torch.nn.ModuleDict()
         self.basis_dtype = getattr(self, "basis_dtype", torch.float32)
         
+        self.density_dim = sum(self.density_n_comp)  
+        self.app_feat_dim = sum(self.app_n_comp)     
+        self.total_feat_dim = self.density_dim + self.app_feat_dim
+        
         if not hasattr(self, 'shared_basis_manager'):
-            self.shared_basis_manager = SharedBasisManager(mode=basis_mode, n_basis=self.n_basis, app_dim=self.app_dim,
+            self.shared_basis_manager = SharedBasisManager(mode=basis_mode, n_basis=self.n_basis,
+                                                           input_dim=self.total_feat_dim,
+                                                           output_dim=self.app_dim,
                                                            device=device, dtype=self.basis_dtype,
                                                            sparsity_reg=kargs.pop("basis_sparsity_reg", 0.01),
                                                            adaptive=kargs.pop("basis_adaptive", True))
-        
+
         gate_dtype = self.aabb.dtype  
         self.register_buffer("alpha_gate_scale", torch.ones((), dtype=gate_dtype))
         
@@ -366,70 +381,53 @@ class TensorVMSplitPatch(TensorBase):
         self._lookup_table_valid = True
 
     @torch.no_grad()
-    def _map_coords_to_patch_fast(self, xyz_coords, snap_missing=False, snap_tau=0.5,
-                                adjacent_only=True, return_snapped=False):
+    def _map_coords_to_patch_fast(self, xyz_coords):
         """
-        高效版本的 patch 映射，使用查詢表而非 dict
+        Fast ver: quick lookup table; no snapping. (for most cases)
         """
-        # 確保查詢表是最新的
         if not hasattr(self, '_lookup_table_valid') or not self._lookup_table_valid:
             self.build_patch_lookup_table()
         
         device = xyz_coords.device
         
-        # AABB 正規化
         aabb = self.aabb
         if aabb.numel() == 6:
             aabb = aabb.reshape(2, 3)
         a0, a1 = aabb[0], aabb[1]
         extent = (a1 - a0).clamp_min(1e-8)
         
-        # 空 map 處理
         if not self.patch_map or not hasattr(self, 'patch_lookup'):
             coords = torch.zeros((*xyz_coords.shape[:-1], 3), dtype=torch.long, device=device)
             exists = torch.zeros((*xyz_coords.shape[:-1],), dtype=torch.bool, device=device)
-            if return_snapped:
-                snapped = torch.zeros_like(exists)
-                return coords, exists, snapped
             return coords, exists
         
         Gx, Gy, Gz = self._get_patch_grid_reso()
         G_t = torch.tensor([Gx, Gy, Gz], device=device, dtype=torch.float32)
         
-        # 正規化到 [0,1)
         eps = 1e-6
         p = ((xyz_coords - a0) / extent).clamp(0.0, 1.0 - eps)
         idx = torch.floor(p * G_t).long()
         
-        # Clamp 到有效範圍
         idx[..., 0] = torch.clamp(idx[..., 0], 0, Gx - 1)
         idx[..., 1] = torch.clamp(idx[..., 1], 0, Gy - 1)
         idx[..., 2] = torch.clamp(idx[..., 2], 0, Gz - 1)
         
-        # 使用查詢表快速檢查存在性
         flat_shape = idx.shape[:-1]
         idx_flat = idx.view(-1, 3)
         
-        # 批量查詢
         patch_indices = self.patch_lookup[idx_flat[:, 0], idx_flat[:, 1], idx_flat[:, 2]]
         exists_flat = (patch_indices >= 0)
         
         exists = exists_flat.view(*flat_shape)
         coords_out = idx
         
-        # Snap missing（如果需要）
-        snapped = torch.zeros_like(exists, dtype=torch.bool)
-        if snap_missing:
-            # ... snap 邏輯保持不變 ...
-            pass
-        
-        if return_snapped:
-            return coords_out, exists, snapped
         return coords_out, exists
 
     @torch.no_grad()
-    def _map_coords_to_patch(self, xyz_coords, snap_missing: bool = False, snap_tau: float = 0.5,
-                             adjacent_only: bool = True, return_snapped: bool = False):
+    def _map_coords_to_patch(self, xyz_coords, snap_missing: bool = False, snap_tau: float = 0.5, return_snapped: bool = False):
+        """
+        Full ver: support to snap to nearset neighbor. (mainly used in forward process)
+        """
         device = xyz_coords.device
 
         # --- AABB to (2,3) ---
@@ -490,7 +488,7 @@ class TensorVMSplitPatch(TensorBase):
                 ok_tau = (dist_cell <= float(snap_tau))
 
                 # 鄰域
-                rad = 1 if adjacent_only else 2
+                rad = 1
                 rng = torch.arange(-rad, rad + 1, device=device, dtype=torch.long)
                 dx, dy, dz = torch.meshgrid(rng, rng, rng, indexing='ij')
                 nbr = torch.stack([dx.reshape(-1), dy.reshape(-1), dz.reshape(-1)], dim=1)  # [K,3], K=(2r+1)^3
@@ -748,10 +746,15 @@ class TensorVMSplitPatch(TensorBase):
             'app_line': app_line,
         }
 
-        temp_key = (0, 0, 0)
-        in_dim = self._app_in_dim_from_vm(patch['app_plane'], patch['app_line'])
-        basis = self.get_shared_basis(temp_key, in_dim)
-        patch['basis_mat'] = basis
+        if self.use_shared_basis and hasattr(self, 'shared_basis_manager'):
+            temp_key = (0, 0, 0)  
+            in_dim = self.total_feat_dim 
+            basis = self.shared_basis_manager.get_or_create_basis(
+                temp_key, 
+                in_dim,
+                {'res': gridSize}
+            )
+            patch['basis_mat'] = basis
 
         if bool(getattr(self, "enable_child_residual", True)):
             if not self.global_basis_enable:
@@ -1085,9 +1088,9 @@ class TensorVMSplitPatch(TensorBase):
         
         # 使用標準的 VM tensors（不需要 global basis 重建）
         for i, (plane, line) in enumerate(zip(patch['density_plane'], patch['density_line'])):
-            pfeat = self._gs2d_1CHW(plane, coord_plane[i])  # (N, C)
-            lfeat = self._gs1d_1CL1(line,  coord_line[i])   # (N, C)
-            sigma_acc += (pfeat * lfeat).sum(dim=1)         # -> (N,)
+            pfeat = self._gs2d_1CHW(plane, coord_plane[i])  # [N, C]
+            lfeat = self._gs1d_1CL1(line,  coord_line[i])   # [N, C]
+            sigma_acc += (pfeat * lfeat).sum(dim=1)         # -> [N,]
 
         # residual (only active in the interior -> boundary continuity)
         if bool(getattr(self, "enable_child_residual", True)):
@@ -1097,14 +1100,48 @@ class TensorVMSplitPatch(TensorBase):
                 g = self._interior_gate(xyz_sampled).squeeze(-1)  # [N]
                 r_acc = torch.zeros_like(sigma_acc)
                 for i, (rplane, rline) in enumerate(zip(rpl, rln)):
-                    rp = self._gs2d_1CHW(rplane, coord_plane[i])  # (N, C)
-                    rl = self._gs1d_1CL1(rline,  coord_line[i])   # (N, C)
-                    r_acc += (rp * rl).sum(dim=1)                 # (N,)
+                    rp = self._gs2d_1CHW(rplane, coord_plane[i])  # [N, C]
+                    rl = self._gs1d_1CL1(rline,  coord_line[i])   # [N, C]
+                    r_acc += (rp * rl).sum(dim=1)                 # -> [N,]
                 sigma_acc = sigma_acc + g * r_acc
 
         # seam blending near patch faces (inference-time smoothing, no extra params/loss)
         sigma_acc = self._blend_with_neighbors_if_needed(patch, xyz_sampled, sigma_acc, kind="density")
         return sigma_acc
+
+    def compute_densityfeature_patch(self, patch, pts):
+        """
+        計算 density features（不含 feature2density 轉換）
+        - pts: [N,3] local coords in [0,1]
+        Returns:
+            density_feat: [N, density_dim]
+        """
+        coord_plane, coord_line = self._get_patch_coords(pts)
+        
+        # 收集所有 density features
+        features = []
+        for i, (plane, line) in enumerate(zip(patch['density_plane'], patch['density_line'])):
+            pfeat = self._gs2d_1CHW(plane, coord_plane[i])  # [N, C_i]
+            lfeat = self._gs1d_1CL1(line, coord_line[i])    # [N, C_i]
+            features.append(pfeat * lfeat)  # [N, C_i]
+        
+        density_feat = torch.cat(features, dim=1)  # [N, sum(density_n_comp)]
+        
+        # 加入 residual features
+        if bool(getattr(self, "enable_child_residual", True)):
+            rpl = patch.get('density_plane_res', None)
+            rln = patch.get('density_line_res', None)
+            if (rpl is not None) and (rln is not None):
+                g = self._interior_gate(pts)  # [N, 1]
+                res_features = []
+                for i, (rplane, rline) in enumerate(zip(rpl, rln)):
+                    rp = self._gs2d_1CHW(rplane, coord_plane[i])  # [N, C_i]
+                    rl = self._gs1d_1CL1(rline, coord_line[i])    # [N, C_i]
+                    res_features.append(rp * rl)
+                res_feat = torch.cat(res_features, dim=1)
+                density_feat = density_feat + g * res_feat
+        
+        return density_feat
 
     def compute_app_patch(self, patch, xyz):
         """
@@ -1122,15 +1159,16 @@ class TensorVMSplitPatch(TensorBase):
         lz = self._line_param_for(patch, 'app', 2)
 
         # base features: grid-sample each mode with the right coordinate pairing
-        fx = self._gs2d_1CHW(px, xyz[:, [1, 2]])  # (N, Cx)
-        fy = self._gs2d_1CHW(py, xyz[:, [0, 2]])  # (N, Cy)
-        fz = self._gs2d_1CHW(pz, xyz[:, [0, 1]])  # (N, Cz)
+        fx = self._gs2d_1CHW(px, xyz[:, [1, 2]])  # [N, Cx]
+        fy = self._gs2d_1CHW(py, xyz[:, [0, 2]])  # [N, Cy]
+        fz = self._gs2d_1CHW(pz, xyz[:, [0, 1]])  # [N, Cz]
 
-        gx = self._gs1d_1CL1(lx, xyz[:, [0]])     # (N, Cx)
-        gy = self._gs1d_1CL1(ly, xyz[:, [1]])     # (N, Cy)
-        gz = self._gs1d_1CL1(lz, xyz[:, [2]])     # (N, Cz)
-
-        feat = torch.cat([fx, fy, fz, gx, gy, gz], dim=1)  # (N, C_total)
+        gx = self._gs1d_1CL1(lx, xyz[:, [0]])     # [N, Cx]
+        gy = self._gs1d_1CL1(ly, xyz[:, [1]])     # [N, Cy]
+        gz = self._gs1d_1CL1(lz, xyz[:, [2]])     # [N, Cz]
+        
+        sigma_feature = self.compute_densityfeature_patch(patch, xyz)  # [N, density_dim]
+        app_features = torch.cat([fx, fy, fz, gx, gy, gz], dim=1)  # (N, app_feat_dim)
 
         # interior-gated residuals
         if bool(getattr(self, "enable_child_residual", True)):
@@ -1139,7 +1177,9 @@ class TensorVMSplitPatch(TensorBase):
             if (rpl is not None) and (rln is not None):
                 rfeat = self._app_feat_raw(patch, xyz)
                 g = self._interior_gate(xyz)  # [N,1]
-                feat = feat + g * rfeat
+                app_features = app_features + g * rfeat
+
+        combined_feat = torch.cat([sigma_feature, app_features], dim=-1)  # [N, total_feat_dim]
 
         # 使用 SharedBasisManager 或傳統 basis_mat
         if hasattr(self, 'shared_basis_manager') and self.shared_basis_manager.mode == 'global':
@@ -1152,19 +1192,18 @@ class TensorVMSplitPatch(TensorBase):
                         patch_key = k
                         break
                 if patch_key is None:
-                    patch_key = (0, 0, 0)  # fallback
+                    patch_key = (0, 0, 0)  
             
-            # 使用 GlobalBasisWrapper（它實現了 forward 方法）
             if 'basis_mat' not in patch:
                 # 第一次使用，創建 wrapper
                 patch['basis_mat'] = self.shared_basis_manager.get_or_create_basis(
-                    patch_key, feat.shape[1], {'res': patch.get('res', [32,32,32])}
+                    patch_key, combined_feat.shape[1], {'res': patch.get('res', [32,32,32])}
                 )
-            out = patch['basis_mat'](feat)  # GlobalBasisWrapper.forward
+            out = patch['basis_mat'](combined_feat)  # GlobalBasisWrapper.forward
         else:
             # 傳統路徑：每個 patch 有自己的 basis_mat
-            self._ensure_basis_for_feat(patch, feat.shape[1])
-            out = patch['basis_mat'](feat)  # (N, app_dim)
+            self._ensure_basis_for_feat(patch, combined_feat.shape[1])
+            out = patch['basis_mat'](combined_feat)  # [N, app_dim]
 
         # seam blending near patch faces
         out = self._blend_with_neighbors_if_needed(patch, xyz, out, kind="app")
@@ -2652,7 +2691,7 @@ class TensorVMSplitPatch(TensorBase):
         world = a0 + (a1 - a0) * grid                      # [N,3] world coords
 
         # map once to patches
-        patch_coords, exists = self._map_coords_to_patch(world)
+        patch_coords, exists = self._map_coords_to_patch_fast(world)
         norm = self.normalize_coord(world)
 
         # step & gate
@@ -2861,7 +2900,7 @@ class TensorVMSplitPatch(TensorBase):
 
         Strategy:
         - Sample random xyz in the AABB.
-        - Use hierarchical `_map_coords_to_patch(xyz, snap_missing=False)` to detect real holes.
+        - Use hierarchical `_map_coords_to_patch_fast` to detect real holes.
         - If miss ratio <= target, return 0.
         - Otherwise, create new *parent-level* patches at base grid keys for a small
           subset of missing locations (<= seed_cells). Initialize each new patch
@@ -2876,7 +2915,7 @@ class TensorVMSplitPatch(TensorBase):
         xyz = self.aabb[0] + (self.aabb[1]-self.aabb[0]) * u
 
         # Depth-aware existence check
-        _, exists = self._map_coords_to_patch(xyz, snap_missing=False)
+        _, exists = self._map_coords_to_patch_fast(xyz)
         miss_ratio = float((~exists).float().mean().item())
 
         if miss_ratio <= float(target_miss):
@@ -3109,7 +3148,7 @@ class TensorVMSplitPatch(TensorBase):
         xyz = a0 + p * extent
         xyz = xyz.reshape(-1, 3)
 
-        coords, exists = self._map_coords_to_patch(xyz)
+        coords, exists = self._map_coords_to_patch_fast(xyz)
         total = xyz.shape[0]
         frac_exists = exists.float().mean().item()
 
@@ -3504,7 +3543,7 @@ class TensorVMSplitPatch(TensorBase):
 
         xyz_norm = self.normalize_coord(xyz)
 
-        patch_coords, exists = self._map_coords_to_patch(xyz)
+        patch_coords, exists = self._map_coords_to_patch_fast(xyz)
 
         sigma_feat = self.compute_density_patchwise_fast(xyz_norm, patch_coords)  # [n]
         sigma = self.feature2density(sigma_feat)                                  # [n]
@@ -3524,7 +3563,7 @@ class TensorVMSplitPatch(TensorBase):
         u = torch.rand((n, 3), device=dev)
         xyz = self.aabb[0] + (self.aabb[1] - self.aabb[0]) * u
         xyz_norm = self.normalize_coord(xyz)
-        coords, exists = self._map_coords_to_patch(xyz)
+        coords, exists = self._map_coords_to_patch_fast(xyz)
 
  
         sigma_feat = self.compute_density_patchwise_fast(xyz_norm, coords)  # [n]
@@ -3645,7 +3684,7 @@ class TensorVMSplitPatch(TensorBase):
         world_coords = aabb0 + (aabb1 - aabb0) * grid_coords
 
         # map to patches once (for warnings / optional masking)
-        patch_coords, exists = self._map_coords_to_patch(world_coords)
+        patch_coords, exists = self._map_coords_to_patch_fast(world_coords)
         miss_ratio = 1.0 - exists.float().mean().item()
         if miss_ratio > 0.3:
             print(f"[WARNING] {miss_ratio:.0%} of dense alpha samples map to MISSING patches (fallback risk)!")
@@ -3787,7 +3826,7 @@ class TensorVMSplitPatch(TensorBase):
             rays_o, rays_d = rays[:, :3], rays[:, 3:6]
             mid, hit = self._ray_aabb_midpoint(rays_o, rays_d)
             if hit.any():
-                coords, exists = self._map_coords_to_patch(mid[hit])
+                coords, exists = self._map_coords_to_patch_fast(mid[hit])
                 miss_ratio = 1.0 - exists.float().mean().item()
                 if miss_ratio > 0.3:
                     print(f"[WARNING] {miss_ratio:.0%} of patch log samples map to MISSING patches (fallback risk)!")
@@ -3796,7 +3835,7 @@ class TensorVMSplitPatch(TensorBase):
                 keys = []
         elif rays.shape[-1] == 3:
             # Fallback: treat inputs as world-space positions (no dir info)
-            coords, exists = self._map_coords_to_patch(rays)
+            coords, exists = self._map_coords_to_patch_fast(rays)
             miss_ratio = 1.0 - exists.float().mean().item()
             if miss_ratio > 0.3:
                 print(f"[WARNING] {miss_ratio:.0%} of patch log samples map to MISSING patches (fallback risk)!")
@@ -3994,9 +4033,8 @@ class TensorVMSplitPatch(TensorBase):
             pts_world = xyz_sampled[ray_valid]  # world coords for valid samples
             pts_norm  = self.normalize_coord(pts_world)
             coords, exists, snapped = self._map_coords_to_patch(pts_world,
-                                                                snap_missing=bool(getattr(self, "repair_enable", True)),
-                                                                snap_tau=float(getattr(self, "repair_tau", 1.0)),
-                                                                adjacent_only=bool(getattr(self, "repair_adjacent_only", True)),
+                                                                snap_missing=self.repair_enable,
+                                                                snap_tau=self.repair_tau,
                                                                 return_snapped=True)
 
             if is_train and torch.rand(()) < 0.01:
@@ -4038,9 +4076,8 @@ class TensorVMSplitPatch(TensorBase):
             pts_norm  = self.normalize_coord(pts_world)
             dirs_sub  = viewdirs[app_mask]
             coords, exists, snapped = self._map_coords_to_patch(pts_world,
-                                                                snap_missing=bool(getattr(self, "repair_enable", True)),
-                                                                snap_tau=float(getattr(self, "repair_tau", 1.0)),
-                                                                adjacent_only=bool(getattr(self, "repair_adjacent_only", True)),
+                                                                snap_missing=self.repair_enable,
+                                                                snap_tau=self.repair_tau,
                                                                 return_snapped=True)
             if is_train and torch.rand(()) < 0.01:
                 print(f"[repair] snapped(appearance)={snapped.float().mean().item():.3f}")
